@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin>
+    <n>Network Connections</n>
+    <key>netstatconnections</key>
+    <version>1.1.0</version>
+    <inventory_sections>
+        <section name="NETWORK_CONNECTIONS">
+            <field name="PROTOCOL"          type="string" />
+            <field name="LOCAL_ADDR"        type="string" />
+            <field name="LOCAL_PORT"        type="integer" />
+            <field name="REMOTE_ADDR"       type="string" />
+            <field name="REMOTE_PORT"       type="integer" />
+            <field name="REMOTE_HOSTNAME"   type="string" />
+            <field name="PROCESS_NAME"      type="string" />
+            <field name="SERVICE_NAME"      type="string" />
+            <field name="STATE"             type="string" />
+            <field name="CREATED_AT"        type="string" />
+            <field name="OFFLOAD_STATE"     type="string" />
+            <field name="APPLIED_SETTING"   type="string" />
+            <field name="COLLECTION_METHOD" type="string" />
+            <field name="CONN_DIRECTION"    type="string" />
+            <field name="SERVICE_PORT"      type="integer" />
+        </section>
+        <section name="LISTENING_PORTS">
+            <field name="PROTOCOL"     type="string" />
+            <field name="LOCAL_ADDR"   type="string" />
+            <field name="LOCAL_PORT"   type="integer" />
+            <field name="PROCESS_NAME" type="string" />
+            <field name="SERVICE_NAME" type="string" />
+            <field name="CREATED_AT"   type="string" />
+        </section>
+    </inventory_sections>
+</plugin>
