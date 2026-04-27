@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(\\(Get-Item \"C:\\\\Users\\\\bernarch\\\\Downloads\\\\netstatconnections_v1.3.0_github_1.zip\"\\).Length)",
+      "PowerShell($dest = \"C:\\\\Users\\\\bernarch\\\\Downloads\\\\v13_extracted\"; New-Item -ItemType Directory -Force -Path $dest | Out-Null; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory\\(\"C:\\\\Users\\\\bernarch\\\\Downloads\\\\netstatconnections_v1.3.0_github_1.zip\", $dest\\); Get-ChildItem $dest -Recurse | Select-Object FullName)",
+      "PowerShell(cmd /c \"dir C:\\\\Users\\\\bernarch\\\\Downloads\\\\v13_extracted /s /b 2>&1\")"
+    ]
+  }
+}
