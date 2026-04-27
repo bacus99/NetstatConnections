@@ -1,6 +1,6 @@
 <?php
 /**
- * Bulk push endpoint for netstat collector — v1.3.1
+ * Bulk push endpoint for netstat collector — v1.3.2
  *
  * Auth: reuses the GLPI REST API session mechanism.
  *   1. Agent calls /apirest.php/initSession (gets session_token)
@@ -9,11 +9,16 @@
  *      own session_start() resumes the correct session
  */
 
+// Buffer all output so any accidental output from GLPI's bootstrap
+// cannot corrupt our JSON response or cause "connection closed" errors.
+ob_start();
+
 // ── Auth headers — must be read before any output or bootstrap ───────
 $session_token = $_SERVER['HTTP_SESSION_TOKEN'] ?? '';
 $app_token     = $_SERVER['HTTP_APP_TOKEN']     ?? '';
 
 if (empty($session_token)) {
+    ob_end_clean();
     http_response_code(401);
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode(['error' => 'Missing Session-Token header']);
@@ -26,6 +31,9 @@ session_id($session_token);
 // ── Bootstrap GLPI ───────────────────────────────────────────────────
 define('GLPI_ROOT', dirname(__DIR__, 3));
 include_once(GLPI_ROOT . '/inc/includes.php');
+
+// Discard any output the bootstrap may have produced, then take over
+ob_end_clean();
 
 ini_set('memory_limit', '256M');
 set_time_limit(300);

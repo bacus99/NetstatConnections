@@ -681,33 +681,34 @@ $headers['Session-Token'] = $token
 Write-Host "BULK_SESSION:$token"
 
 # POST entire payload to push.php
-$pushUrl = "$BaseUrl/plugins/netstatconnections/front/push.php"
-$body    = Get-Content -Raw $JsonPath
+$pushUrl   = "$BaseUrl/plugins/netstatconnections/front/push.php"
+$bodyBytes = [System.Text.Encoding]::UTF8.GetBytes((Get-Content -Raw $JsonPath))
+
+# Remove Content-Type from headers — pass it only via -ContentType to avoid duplicates
+$postHeaders = $headers.Clone()
+$postHeaders.Remove('Content-Type')
 
 try {
-    $resp = Invoke-RestMethod -Uri $pushUrl -Headers $headers -Method Post -Body $body -ContentType 'application/json'
+    $wresp    = Invoke-WebRequest -Uri $pushUrl -Headers $postHeaders -Method Post `
+                    -Body $bodyBytes -ContentType 'application/json' -UseBasicParsing
+    $resp     = $wresp.Content | ConvertFrom-Json
     if ($resp.status -eq 'ok') {
         Write-Host "BULK_OK:pushed=$($resp.pushed),active=$($resp.stats.active),closed=$($resp.stats.closed),locked=$($resp.stats.locked),elapsed=$($resp.elapsed_ms)ms"
     } else {
-        Write-Host "BULK_ERROR:status=$($resp.status),error=$($resp.error)"
+        Write-Host "BULK_ERROR:HTTP=$($wresp.StatusCode) status=$($resp.status) error=$($resp.error)"
     }
-} catch {
-    $errMsg = $_.Exception.Message
-    $respBody = ''
+} catch [System.Net.WebException] {
+    $sc = ''
+    $rb = ''
+    try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
     try {
-        if ($_.Exception.Response) {
-            $stream = $_.Exception.Response.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($stream)
-            $respBody = $reader.ReadToEnd()
-            $reader.Close()
-            $stream.Close()
-        }
+        $st = $_.Exception.Response.GetResponseStream()
+        $rd = New-Object System.IO.StreamReader($st)
+        $rb = $rd.ReadToEnd(); $rd.Close(); $st.Close()
     } catch {}
-    if ($respBody) {
-        Write-Host "BULK_ERROR:$errMsg BODY:$respBody"
-    } else {
-        Write-Host "BULK_ERROR:$errMsg"
-    }
+    Write-Host "BULK_ERROR:HTTP=$sc msg=$($_.Exception.Message) body=$rb"
+} catch {
+    Write-Host "BULK_ERROR:$($_.Exception.Message)"
 }
 
 # Kill session
