@@ -634,7 +634,12 @@ sub _pushViaBulkPS {
 
     my $tmp_json = File::Spec->catfile($vardir, 'netstat-push-payload.json');
     open(my $jfh, '>', $tmp_json) or do { err("Cannot write $tmp_json: $!"); return; };
-    print $jfh encode_json($data);
+    print $jfh encode_json({
+        hostname          => $data->{hostname},
+        collected_at      => $data->{collected_at},
+        collection_method => $data->{collection_method},
+        connections       => $data->{connections},
+    });
     close $jfh;
 
     my $tmp_ps1 = File::Spec->catfile($vardir, 'netstat-bulk-push.ps1');
@@ -757,7 +762,12 @@ sub _pushViaBulkCurl {
 
     my $tmp_json = File::Spec->catfile($vardir, 'netstat-push-payload.json');
     open(my $jfh, '>', $tmp_json) or do { err("Cannot write $tmp_json: $!"); return; };
-    print $jfh encode_json($data);
+    print $jfh encode_json({
+        hostname          => $data->{hostname},
+        collected_at      => $data->{collected_at},
+        collection_method => $data->{collection_method},
+        connections       => $data->{connections},
+    });
     close $jfh;
 
     # Init session
