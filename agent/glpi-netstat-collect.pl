@@ -688,6 +688,18 @@ $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes((Get-Content -Raw $JsonPath))
 $postHeaders = $headers.Clone()
 $postHeaders.Remove('Content-Type')
 
+# Probe: GET to push.php to verify the URL is reachable before POST
+try {
+    $probe = Invoke-WebRequest -Uri $pushUrl -Headers $postHeaders -Method Get -UseBasicParsing
+    Write-Host "BULK_PROBE:HTTP=$($probe.StatusCode)"
+} catch [System.Net.WebException] {
+    $psc = 0
+    try { $psc = [int]$_.Exception.Response.StatusCode } catch {}
+    Write-Host "BULK_PROBE:HTTP=$psc status=$($_.Exception.Status) msg=$($_.Exception.Message)"
+} catch {
+    Write-Host "BULK_PROBE:err=$($_.Exception.Message)"
+}
+
 try {
     $wresp    = Invoke-WebRequest -Uri $pushUrl -Headers $postHeaders -Method Post `
                     -Body $bodyBytes -ContentType 'application/json' -UseBasicParsing
@@ -740,6 +752,8 @@ PS1EOF
             err("GLPI bulk push fatal: $1");
         } elsif ($line =~ /^BULK_ERROR:(.+)/) {
             err("GLPI bulk push error: $1");
+        } elsif ($line =~ /^BULK_PROBE:(.+)/) {
+            info("GLPI push.php probe: $1");
         } elsif ($line =~ /^BULK_SESSION:/) {
             dbg("Session acquired");
         } elsif ($line =~ /^BULK_WARN:(.+)/) {
