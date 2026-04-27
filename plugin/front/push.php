@@ -2,38 +2,13 @@
 /**
  * Bulk push endpoint for netstat collector — v1.3.2
  *
- * Auth: reuses the GLPI REST API session mechanism.
- *   1. Agent calls /apirest.php/initSession (gets session_token)
- *   2. Agent POSTs here with Session-Token + App-Token headers
- *   3. session_id() is set BEFORE the GLPI bootstrap so that GLPI's
- *      own session_start() resumes the correct session
+ * Session handling matches v1.2: bootstrap GLPI first (no session),
+ * then session_id() + session_start() to resume the REST API session.
  */
 
-// Buffer all output so any accidental output from GLPI's bootstrap
-// cannot corrupt our JSON response or cause "connection closed" errors.
-ob_start();
-
-// ── Auth headers — must be read before any output or bootstrap ───────
-$session_token = $_SERVER['HTTP_SESSION_TOKEN'] ?? '';
-$app_token     = $_SERVER['HTTP_APP_TOKEN']     ?? '';
-
-if (empty($session_token)) {
-    ob_end_clean();
-    http_response_code(401);
-    header('Content-Type: application/json; charset=utf-8');
-    echo json_encode(['error' => 'Missing Session-Token header']);
-    exit;
-}
-
-// Set the session ID BEFORE GLPI bootstrap calls session_start()
-session_id($session_token);
-
-// ── Bootstrap GLPI ───────────────────────────────────────────────────
+// ── Bootstrap GLPI (does not start a session by itself) ──────────────
 define('GLPI_ROOT', dirname(__DIR__, 3));
 include_once(GLPI_ROOT . '/inc/includes.php');
-
-// Discard any output the bootstrap may have produced, then take over
-ob_end_clean();
 
 ini_set('memory_limit', '256M');
 set_time_limit(300);
@@ -46,22 +21,32 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit;
 }
 
-// ── Verify the session is valid ──────────────────────────────────────
+// ── Auth headers ─────────────────────────────────────────────────────
+$session_token = $_SERVER['HTTP_SESSION_TOKEN'] ?? '';
+$app_token     = $_SERVER['HTTP_APP_TOKEN']     ?? '';
+
+if (empty($session_token)) {
+    http_response_code(401);
+    echo json_encode(['error' => 'Missing Session-Token header']);
+    exit;
+}
+
+// ── Resume the REST API session (v1.2 pattern) ───────────────────────
+session_id($session_token);
+session_start();
+
 if (!isset($_SESSION['glpiID']) || empty($_SESSION['glpiID'])) {
     http_response_code(401);
     echo json_encode(['error' => 'Invalid or expired session — call initSession first']);
     exit;
 }
 
-// ── Validate App-Token against GLPI's API client table ──────────────
+// ── Validate App-Token ───────────────────────────────────────────────
 if (!empty($app_token)) {
     global $DB;
     $api_client = $DB->request([
         'FROM'  => 'glpi_apiclients',
-        'WHERE' => [
-            'app_token' => $app_token,
-            'is_active' => 1,
-        ],
+        'WHERE' => ['app_token' => $app_token, 'is_active' => 1],
         'LIMIT' => 1,
     ])->current();
     if (!$api_client) {
@@ -142,7 +127,7 @@ try {
 
 $elapsed = round((microtime(true) - $t_start) * 1000);
 
-// ── Count active/closed rows for stats ───────────────────────────────
+// ── Stats ────────────────────────────────────────────────────────────
 $stats = ['active' => 0, 'closed' => 0, 'locked' => 0];
 $stat_iter = $DB->request([
     'SELECT' => [
@@ -150,24 +135,19 @@ $stat_iter = $DB->request([
         'is_locked',
         new \Glpi\DBAL\QueryExpression('COUNT(*) AS cnt'),
     ],
-    'FROM'   => 'glpi_plugin_netstatconnections_connections',
-    'WHERE'  => ['computers_id' => $computers_id],
+    'FROM'    => 'glpi_plugin_netstatconnections_connections',
+    'WHERE'   => ['computers_id' => $computers_id],
     'GROUPBY' => ['connection_status', 'is_locked'],
 ]);
 foreach ($stat_iter as $s) {
-    if ((int)$s['is_locked'] === 1) {
-        $stats['locked'] += (int)$s['cnt'];
-    }
-    if ($s['connection_status'] === 'active') {
-        $stats['active'] += (int)$s['cnt'];
-    } else {
-        $stats['closed'] += (int)$s['cnt'];
-    }
+    if ((int)$s['is_locked'] === 1) $stats['locked'] += (int)$s['cnt'];
+    if ($s['connection_status'] === 'active') $stats['active'] += (int)$s['cnt'];
+    else $stats['closed'] += (int)$s['cnt'];
 }
 
 echo json_encode([
     'status'       => 'ok',
-    'version'      => '1.3.1',
+    'version'      => '1.3.2',
     'computers_id' => $computers_id,
     'hostname'     => $hostname,
     'pushed'       => $conn_count,

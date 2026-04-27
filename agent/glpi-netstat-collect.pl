@@ -688,43 +688,6 @@ $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes((Get-Content -Raw $JsonPath))
 $postHeaders = $headers.Clone()
 $postHeaders.Remove('Content-Type')
 
-# Probe 1: GET with no redirect following — shows actual server response
-try {
-    $probe = Invoke-WebRequest -Uri $pushUrl -Headers $postHeaders -Method Get `
-                -UseBasicParsing -MaximumRedirection 0
-    $ct   = $probe.Headers['Content-Type']
-    $snip = ($probe.Content -replace '[\r\n]+',' ')
-    if ($snip.Length -gt 150) { $snip = $snip.Substring(0,150) }
-    Write-Host "BULK_PROBE_GET:HTTP=$($probe.StatusCode) ct=$ct body=$snip"
-} catch [System.Net.WebException] {
-    $psc = 0; $loc = ''
-    try { $psc = [int]$_.Exception.Response.StatusCode } catch {}
-    try { $loc = $_.Exception.Response.Headers['Location'] } catch {}
-    Write-Host "BULK_PROBE_GET:HTTP=$psc redirect=$loc status=$($_.Exception.Status)"
-} catch {
-    Write-Host "BULK_PROBE_GET:err=$($_.Exception.Message)"
-}
-
-# Probe 2: POST with empty body — tests whether POST is blocked at web-server level
-try {
-    $probe2 = Invoke-WebRequest -Uri $pushUrl -Headers $postHeaders -Method Post `
-                -Body ([byte[]]@()) -ContentType 'application/json' -UseBasicParsing -MaximumRedirection 0
-    Write-Host "BULK_PROBE_POST:HTTP=$($probe2.StatusCode)"
-} catch [System.Net.WebException] {
-    $psc2 = 0; $rb2 = ''
-    try { $psc2 = [int]$_.Exception.Response.StatusCode } catch {}
-    try {
-        $st2 = $_.Exception.Response.GetResponseStream()
-        $rd2 = New-Object System.IO.StreamReader($st2)
-        $rb2 = ($rd2.ReadToEnd() -replace '[\r\n]+',' ')
-        $rd2.Close(); $st2.Close()
-        if ($rb2.Length -gt 150) { $rb2 = $rb2.Substring(0,150) }
-    } catch {}
-    Write-Host "BULK_PROBE_POST:HTTP=$psc2 status=$($_.Exception.Status) body=$rb2"
-} catch {
-    Write-Host "BULK_PROBE_POST:err=$($_.Exception.Message)"
-}
-
 try {
     $wresp    = Invoke-WebRequest -Uri $pushUrl -Headers $postHeaders -Method Post `
                     -Body $bodyBytes -ContentType 'application/json' -UseBasicParsing
@@ -777,10 +740,6 @@ PS1EOF
             err("GLPI bulk push fatal: $1");
         } elsif ($line =~ /^BULK_ERROR:(.+)/) {
             err("GLPI bulk push error: $1");
-        } elsif ($line =~ /^BULK_PROBE_GET:(.+)/) {
-            info("GLPI probe GET: $1");
-        } elsif ($line =~ /^BULK_PROBE_POST:(.+)/) {
-            info("GLPI probe POST: $1");
         } elsif ($line =~ /^BULK_SESSION:/) {
             dbg("Session acquired");
         } elsif ($line =~ /^BULK_WARN:(.+)/) {
