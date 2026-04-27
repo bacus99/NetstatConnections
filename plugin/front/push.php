@@ -1,21 +1,27 @@
 <?php
 /**
- * Bulk push endpoint for netstat collector — v1.3.0
- *
- * Receives the full JSON payload from the agent in one POST, then calls
- * handleInventory() which merges (match/update/insert/mark-closed).
+ * Bulk push endpoint for netstat collector — v1.3.1
  *
  * Auth: reuses the GLPI REST API session mechanism.
  *   1. Agent calls /apirest.php/initSession (gets session_token)
  *   2. Agent POSTs here with Session-Token + App-Token headers
- *   3. We resume that session and verify the user is valid
- *
- * Payload format:
- *   { "hostname": "SRV-SQL01",
- *     "collected_at": "2026-04-24 15:30:00",
- *     "collection_method": "PowerShell+CreationTime",
- *     "connections": [ { "protocol": "TCP", ... }, ... ] }
+ *   3. session_id() is set BEFORE the GLPI bootstrap so that GLPI's
+ *      own session_start() resumes the correct session
  */
+
+// ── Auth headers — must be read before any output or bootstrap ───────
+$session_token = $_SERVER['HTTP_SESSION_TOKEN'] ?? '';
+$app_token     = $_SERVER['HTTP_APP_TOKEN']     ?? '';
+
+if (empty($session_token)) {
+    http_response_code(401);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['error' => 'Missing Session-Token header']);
+    exit;
+}
+
+// Set the session ID BEFORE GLPI bootstrap calls session_start()
+session_id($session_token);
 
 // ── Bootstrap GLPI ───────────────────────────────────────────────────
 define('GLPI_ROOT', dirname(__DIR__, 3));
@@ -32,24 +38,21 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit;
 }
 
-// ── Auth: Session-Token + App-Token ──────────────────────────────────
-$session_token = $_SERVER['HTTP_SESSION_TOKEN'] ?? '';
-$app_token     = $_SERVER['HTTP_APP_TOKEN']     ?? '';
-
-if (empty($session_token)) {
+// ── Verify the session is valid ──────────────────────────────────────
+if (!isset($_SESSION['glpiID']) || empty($_SESSION['glpiID'])) {
     http_response_code(401);
-    echo json_encode(['error' => 'Missing Session-Token header']);
+    echo json_encode(['error' => 'Invalid or expired session — call initSession first']);
     exit;
 }
 
-// Validate App-Token against GLPI's API client table
+// ── Validate App-Token against GLPI's API client table ──────────────
 if (!empty($app_token)) {
     global $DB;
     $api_client = $DB->request([
         'FROM'  => 'glpi_apiclients',
         'WHERE' => [
-            'app_token'    => $app_token,
-            'is_active'    => 1,
+            'app_token' => $app_token,
+            'is_active' => 1,
         ],
         'LIMIT' => 1,
     ])->current();
@@ -58,17 +61,6 @@ if (!empty($app_token)) {
         echo json_encode(['error' => 'Invalid or inactive App-Token']);
         exit;
     }
-}
-
-// Resume the REST API session
-session_id($session_token);
-Session::setPath();
-session_start();
-
-if (!isset($_SESSION['glpiID']) || empty($_SESSION['glpiID'])) {
-    http_response_code(401);
-    echo json_encode(['error' => 'Invalid or expired session — call initSession first']);
-    exit;
 }
 
 // ── Read & validate payload ──────────────────────────────────────────
@@ -167,7 +159,7 @@ foreach ($stat_iter as $s) {
 
 echo json_encode([
     'status'       => 'ok',
-    'version'      => '1.3.0',
+    'version'      => '1.3.1',
     'computers_id' => $computers_id,
     'hostname'     => $hostname,
     'pushed'       => $conn_count,
