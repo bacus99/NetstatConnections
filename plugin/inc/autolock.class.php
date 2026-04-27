@@ -145,7 +145,7 @@ class PluginNetstatconnectionsAutolock {
                     'computers_id'    => $computers_id,
                     'remote_addr'     => $row['remote_addr'],
                     'protocol'        => $row['protocol'],
-                    'remote_itemtype' => ['Computer', 'Cluster'],
+                    'remote_itemtype' => ['Computer', 'Cluster', 'DatabaseInstance'],
                     ['NOT' => ['remote_items_id' => null]],
                     ['NOT' => ['remote_items_id' => 0]],
                 ];
@@ -198,23 +198,74 @@ class PluginNetstatconnectionsAutolock {
             $proto = $row['protocol'] ?? 'TCP';
             $label = self::getPortLabel($svcport, $proto);
 
+            // ── Pillar 2: DatabaseInstance resolution ────────────────
+            // If this is a database port, try to resolve to a DatabaseInstance
+            $is_db_port = (int)($policy['is_database_port'] ?? 0);
+            $impact_target_type = $remote_type;
+            $impact_target_id   = $remote_id;
+            $chain_host_type    = '';
+            $chain_host_id      = 0;
+
+            if ($is_db_port && class_exists('PluginNetstatconnectionsResolver')) {
+                $instance = PluginNetstatconnectionsResolver::resolveToInstance(
+                    $remote_type, $remote_id, $svcport
+                );
+                if ($instance) {
+                    // Target the DatabaseInstance instead of the Computer/Cluster
+                    $impact_target_type = 'DatabaseInstance';
+                    $impact_target_id   = (int)$instance['id'];
+
+                    // Pillar 3: chain DatabaseInstance → host (Computer or Cluster)
+                    $chain = PluginNetstatconnectionsResolver::resolveInstanceChain((int)$instance['id']);
+                    if (!empty($chain) && $chain['host_id'] > 0 && !empty($chain['host_type'])) {
+                        $chain_host_type = $chain['host_type'];
+                        $chain_host_id   = $chain['host_id'];
+                    }
+
+                    // Update the connection row with the resolved instance
+                    try {
+                        $DB->update('glpi_plugin_netstatconnections_connections', [
+                            'remote_items_id' => $impact_target_id,
+                            'remote_itemtype' => $impact_target_type,
+                            'resolved_via'    => 'db_instance',
+                        ], ['id' => (int)$row['id']]);
+                    } catch (\Throwable $e) {
+                        $DB->update('glpi_plugin_netstatconnections_connections', [
+                            'remote_items_id' => $impact_target_id,
+                            'remote_itemtype' => $impact_target_type,
+                        ], ['id' => (int)$row['id']]);
+                    }
+                }
+            }
+
             // Clean both directions first
-            self::removeImpactRelation('Computer', $computers_id, $remote_type, $remote_id);
-            self::removeImpactRelation($remote_type, $remote_id, 'Computer', $computers_id);
+            self::removeImpactRelation('Computer', $computers_id, $impact_target_type, $impact_target_id);
+            self::removeImpactRelation($impact_target_type, $impact_target_id, 'Computer', $computers_id);
 
             if ($direction === 'impacts') {
                 // Remote impacts us (if remote goes down, we break)
-                $src_type = $remote_type; $src_id = $remote_id;
-                $dst_type = 'Computer';   $dst_id = $computers_id;
+                $src_type = $impact_target_type; $src_id = $impact_target_id;
+                $dst_type = 'Computer';          $dst_id = $computers_id;
             } else {
                 // We impact them (they depend on us)
-                $src_type = 'Computer';   $src_id = $computers_id;
-                $dst_type = $remote_type; $dst_id = $remote_id;
+                $src_type = 'Computer';          $src_id = $computers_id;
+                $dst_type = $impact_target_type; $dst_id = $impact_target_id;
             }
 
             self::ensureImpactItem($src_type, $src_id);
             self::ensureImpactItem($dst_type, $dst_id);
             self::ensureImpactRelation($src_type, $src_id, $dst_type, $dst_id, $label);
+
+            // ── Pillar 3: Chain — DatabaseInstance → Cluster ─────────
+            if ($chain_host_id > 0 && !empty($chain_host_type)) {
+                self::ensureImpactItem($chain_host_type, $chain_host_id);
+                // Instance → Cluster (the instance depends on the cluster)
+                self::ensureImpactRelation(
+                    'DatabaseInstance', $impact_target_id,
+                    $chain_host_type, $chain_host_id,
+                    $label . ' (host)'
+                );
+            }
         }
 
         return 1;

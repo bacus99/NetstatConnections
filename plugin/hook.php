@@ -28,7 +28,7 @@ function plugin_netstatconnections_install(): bool {
             `remote_items_id`   INT(11)      DEFAULT NULL,
             `remote_itemtype`   VARCHAR(100) DEFAULT NULL,
             `remote_scope`      VARCHAR(20)  DEFAULT NULL,
-            `resolved_via`      ENUM('glpi_ip','dns','unresolved','lock','autolock') DEFAULT NULL,
+            `resolved_via`      ENUM('glpi_ip','dns','unresolved','lock','autolock','sibling','db_instance') DEFAULT NULL,
             `resolved_at`       TIMESTAMP    NULL DEFAULT NULL,
             `conn_direction`    VARCHAR(10)  DEFAULT NULL,
             `service_port`      SMALLINT UNSIGNED DEFAULT NULL,
@@ -49,7 +49,7 @@ function plugin_netstatconnections_install(): bool {
         'remote_items_id'   => "INT(11) DEFAULT NULL AFTER `impact_direction`",
         'remote_itemtype'   => "VARCHAR(100) DEFAULT NULL AFTER `remote_items_id`",
         'remote_scope'      => "VARCHAR(20) DEFAULT NULL AFTER `remote_itemtype`",
-        'resolved_via'      => "ENUM('glpi_ip','dns','unresolved','lock','autolock') DEFAULT NULL AFTER `remote_scope`",
+        'resolved_via'      => "ENUM('glpi_ip','dns','unresolved','lock','autolock','db_instance') DEFAULT NULL AFTER `remote_scope`",
         'resolved_at'       => "TIMESTAMP NULL DEFAULT NULL AFTER `resolved_via`",
         'conn_direction'    => "VARCHAR(10) DEFAULT NULL AFTER `resolved_at`",
         'service_port'      => "SMALLINT UNSIGNED DEFAULT NULL AFTER `conn_direction`",
@@ -69,8 +69,8 @@ function plugin_netstatconnections_install(): bool {
     if ($DB->fieldExists('glpi_plugin_netstatconnections_connections', 'resolved_via')) {
         $res = $DB->doQuery("SHOW COLUMNS FROM `glpi_plugin_netstatconnections_connections` WHERE Field = 'resolved_via'");
         $col_info = $DB->fetchAssoc($res);
-        if ($col_info && strpos($col_info['Type'], 'autolock') === false) {
-            $DB->doQuery("ALTER TABLE `glpi_plugin_netstatconnections_connections` MODIFY `resolved_via` ENUM('glpi_ip','dns','unresolved','lock','autolock') DEFAULT NULL;");
+        if ($col_info && strpos($col_info['Type'], 'db_instance') === false) {
+            $DB->doQuery("ALTER TABLE `glpi_plugin_netstatconnections_connections` MODIFY `resolved_via` ENUM('glpi_ip','dns','unresolved','lock','autolock','sibling','db_instance') DEFAULT NULL;");
         }
     }
 
@@ -83,9 +83,10 @@ function plugin_netstatconnections_install(): bool {
             `protocol`       VARCHAR(10)  NOT NULL DEFAULT 'TCP',
             `color`          VARCHAR(10)  NOT NULL DEFAULT '#6c757d',
             `direction`      ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
-            `auto_lock`      TINYINT(1)   NOT NULL DEFAULT 0,
-            `auto_direction` ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
-            `comment`        TEXT         DEFAULT NULL,
+            `auto_lock`          TINYINT(1)   NOT NULL DEFAULT 0,
+            `auto_direction`     ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
+            `is_database_port`   TINYINT(1)   NOT NULL DEFAULT 0,
+            `comment`            TEXT         DEFAULT NULL,
             `is_deleted`     TINYINT(1)   NOT NULL DEFAULT 0,
             `date_creation`  TIMESTAMP    NULL DEFAULT NULL,
             `date_mod`       TIMESTAMP    NULL DEFAULT NULL,
@@ -132,11 +133,30 @@ function plugin_netstatconnections_install(): bool {
         }
     }
 
-    // Upgrade: add auto_lock columns if missing
-    foreach (['auto_lock' => "TINYINT(1) NOT NULL DEFAULT 0", 'auto_direction' => "ENUM('impacts','depends') NOT NULL DEFAULT 'impacts'"] as $col => $def) {
+    // Upgrade: add port columns if missing
+    foreach ([
+        'auto_lock'        => "TINYINT(1) NOT NULL DEFAULT 0",
+        'auto_direction'   => "ENUM('impacts','depends') NOT NULL DEFAULT 'impacts'",
+        'is_database_port' => "TINYINT(1) NOT NULL DEFAULT 0",
+    ] as $col => $def) {
         if (!$DB->fieldExists('glpi_plugin_netstatconnections_ports', $col)) {
             $DB->doQuery("ALTER TABLE `glpi_plugin_netstatconnections_ports` ADD `{$col}` {$def};");
         }
+    }
+
+    // Seed is_database_port = 1 for known DB ports (safe to re-run)
+    $DB->doQuery("UPDATE `glpi_plugin_netstatconnections_ports`
+        SET `is_database_port` = 1
+        WHERE `port_number` IN (1433,1521,3306,5432,5022) AND `protocol` = 'TCP'");
+
+    // v1.3.0 Pillar 2: is_database_port flag
+    if (!$DB->fieldExists('glpi_plugin_netstatconnections_ports', 'is_database_port')) {
+        $DB->doQuery("ALTER TABLE `glpi_plugin_netstatconnections_ports` ADD `is_database_port` TINYINT(1) NOT NULL DEFAULT 0 AFTER `auto_direction`;");
+        // Seed known DB ports
+        $db_ports = [1433, 5022, 3306, 1521, 5432, 27017];
+        $DB->update('glpi_plugin_netstatconnections_ports', [
+            'is_database_port' => 1,
+        ], ['port_number' => $db_ports]);
     }
 
     // ── Cron tasks ────────────────────────────────────────────────────

@@ -426,6 +426,21 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                 if ($item_obj->getFromDB($remote_items_id)) {
                     $remote_display = '<a href="' . $item_obj->getLinkURL() . '">'
                         . htmlspecialchars($item_obj->getName()) . '</a>';
+
+                    // For DatabaseInstance, append the host server name
+                    if ($remote_itemtype === 'DatabaseInstance') {
+                        $host_type = $item_obj->fields['itemtype'] ?? '';
+                        $host_id   = (int)($item_obj->fields['items_id'] ?? 0);
+                        if ($host_id > 0 && $host_type) {
+                            $host_obj = new $host_type();
+                            if ($host_obj->getFromDB($host_id)) {
+                                $remote_display .= ' <small class="text-muted">on '
+                                    . '<a href="' . $host_obj->getLinkURL() . '">'
+                                    . htmlspecialchars($host_obj->getName())
+                                    . '</a></small>';
+                            }
+                        }
+                    }
                 }
             }
 

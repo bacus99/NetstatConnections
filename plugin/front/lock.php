@@ -89,11 +89,11 @@ if ($svcPort === 0) {
 
 // ── Lock / Unlock ────────────────────────────────────────────────────
 
-$update = [
-    'is_locked'        => $locked,
-    'impact_direction' => $locked ? $direction : '',
-    'service_port'     => $locked ? $svcPort : 0,
-];
+$update = ['is_locked' => $locked];
+if ($locked) {
+    $update['impact_direction'] = $direction;
+    $update['service_port']     = $svcPort;
+}
 
 $DB->update('glpi_plugin_netstatconnections_connections', $update, $where);
 
@@ -142,24 +142,88 @@ if ($locked && ($remote_items_id === 0 || empty($remote_itemtype))) {
 // ── Impact relations ─────────────────────────────────────────────────
 
 if ($locked && $remote_items_id > 0 && $remote_items_id !== $computers_id) {
-    // Determine source → impacted based on direction
-    if ($direction === 'impacts') {
-        $src_type = 'Computer';  $src_id = $computers_id;
-        $dst_type = $remote_itemtype; $dst_id = $remote_items_id;
-    } else {
-        $src_type = $remote_itemtype; $src_id = $remote_items_id;
-        $dst_type = 'Computer';  $dst_id = $computers_id;
+
+    // ── Pillar 2: Check if this is a database port → resolve to DatabaseInstance
+    $impact_target_type = $remote_itemtype;
+    $impact_target_id   = $remote_items_id;
+    $chain_host_type    = '';
+    $chain_host_id      = 0;
+
+    // Check if the port is flagged as a database port (column may not exist on older installs)
+    $is_db_port = 0;
+    try {
+        $port_def = $DB->request([
+            'SELECT' => ['is_database_port'],
+            'FROM'   => 'glpi_plugin_netstatconnections_ports',
+            'WHERE'  => ['port_number' => $svcPort, 'protocol' => strtoupper($conn['protocol'] ?? 'TCP')],
+            'LIMIT'  => 1,
+        ])->current();
+        $is_db_port = (int)($port_def['is_database_port'] ?? 0);
+    } catch (\Throwable $e) {}
+
+    if ($is_db_port && class_exists('PluginNetstatconnectionsResolver')) {
+        $instance = PluginNetstatconnectionsResolver::resolveToInstance(
+            $remote_itemtype, $remote_items_id, $svcPort
+        );
+        if ($instance) {
+            $impact_target_type = 'DatabaseInstance';
+            $impact_target_id   = (int)$instance['id'];
+
+            // Pillar 3: chain DatabaseInstance → host (Computer or Cluster)
+            $chain = PluginNetstatconnectionsResolver::resolveInstanceChain((int)$instance['id']);
+            if (!empty($chain) && $chain['host_id'] > 0 && !empty($chain['host_type'])) {
+                $chain_host_type = $chain['host_type'];
+                $chain_host_id   = $chain['host_id'];
+            }
+
+            // Persist on connection row (resolved_via may not be in ENUM on older installs)
+            try {
+                $DB->update('glpi_plugin_netstatconnections_connections', [
+                    'remote_items_id' => $impact_target_id,
+                    'remote_itemtype' => $impact_target_type,
+                    'resolved_via'    => 'db_instance',
+                ], $where);
+            } catch (\Throwable $e) {
+                $DB->update('glpi_plugin_netstatconnections_connections', [
+                    'remote_items_id' => $impact_target_id,
+                    'remote_itemtype' => $impact_target_type,
+                ], $where);
+            }
+        }
     }
 
-    // Only remove the direction we are about to create
+    // Determine source → impacted based on direction
+    if ($direction === 'impacts') {
+        $src_type = 'Computer';          $src_id = $computers_id;
+        $dst_type = $impact_target_type; $dst_id = $impact_target_id;
+    } else {
+        $src_type = $impact_target_type; $src_id = $impact_target_id;
+        $dst_type = 'Computer';          $dst_id = $computers_id;
+    }
+
+    // Clean old relations
     _removeImpactRelation($src_type, $src_id, $dst_type, $dst_id);
+    _removeImpactRelation($dst_type, $dst_id, $src_type, $src_id);
 
     // Create the correct direction
     _ensureImpactRelation($src_type, $src_id, $dst_type, $dst_id, $port_label);
+
+    // Pillar 3: chain — DatabaseInstance → Cluster
+    if ($chain_host_id > 0 && !empty($chain_host_type)) {
+        _ensureImpactRelation(
+            'DatabaseInstance', $impact_target_id,
+            $chain_host_type, $chain_host_id,
+            $port_label . ' (host)'
+        );
+    }
+
 } elseif (!$locked) {
-    // Unlock — remove impact relations
+    // Unlock — remove impact relations (check both Computer and DatabaseInstance)
     _removeImpactRelation('Computer', $computers_id, $remote_itemtype ?: 'Computer', $remote_items_id);
     _removeImpactRelation($remote_itemtype ?: 'Computer', $remote_items_id, 'Computer', $computers_id);
+    // Also clean any DatabaseInstance relations
+    _removeImpactRelation('Computer', $computers_id, 'DatabaseInstance', $remote_items_id);
+    _removeImpactRelation('DatabaseInstance', $remote_items_id, 'Computer', $computers_id);
 }
 
 echo json_encode([

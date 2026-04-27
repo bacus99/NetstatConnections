@@ -90,6 +90,15 @@ class PluginNetstatconnectionsPort extends CommonDropdown {
             'searchtype'    => ['equals'],
             'massiveaction' => true,
         ];
+        $tab[] = [
+            'id'            => 15,
+            'table'         => self::getTable(),
+            'field'         => 'is_database_port',
+            'name'          => __('DB Port'),
+            'datatype'      => 'specific',
+            'searchtype'    => ['equals'],
+            'massiveaction' => true,
+        ];
 
         return $tab;
     }
@@ -138,6 +147,16 @@ class PluginNetstatconnectionsPort extends CommonDropdown {
                          . '<i class="ti ti-arrow-left"></i> depends</span>';
                 }
                 return '<span class="text-muted">—</span>';
+
+            case 'is_database_port':
+                if ((int)$val) {
+                    return '<span style="color:#dc3545" title="Database port — resolves to DatabaseInstance">'
+                         . '<i class="ti ti-database" style="font-size:16px"></i>'
+                         . '</span>';
+                }
+                return '<span style="color:#ccc" title="Not a database port">'
+                     . '<i class="ti ti-database-off" style="font-size:16px"></i>'
+                     . '</span>';
         }
 
         return parent::getSpecificValueToDisplay($field, $values, $options);
@@ -168,6 +187,13 @@ class PluginNetstatconnectionsPort extends CommonDropdown {
                     'size'  => 6,
                     'display' => false,
                 ]);
+
+            case 'is_database_port':
+                return Dropdown::showFromArray(
+                    $name,
+                    [0 => __('No'), 1 => __('Yes')],
+                    ['display' => false, 'value' => $values[$field] ?? '']
+                );
         }
 
         return parent::getSpecificValueToSelect($field, $name, $values, $options);
@@ -303,7 +329,28 @@ class PluginNetstatconnectionsPort extends CommonDropdown {
         ]);
         echo '</td></tr>';
 
-        // Row 4: Comment
+        // Row 4: Database port flag
+        echo '<tr><td>' . __('Database Port') . '</td><td>';
+        Dropdown::showFromArray('is_database_port', [0 => __('No'), 1 => __('Yes')], [
+            'value' => $this->fields['is_database_port'] ?? 0,
+        ]);
+        echo '</td><td colspan="2"><small class="text-muted">'
+           . __('Resolve to DatabaseInstance in impact analysis', 'netstatconnections')
+           . '</small></td></tr>';
+
+        // Row 4: Database Port
+        echo '<tr><td>' . __('Database Port') . '</td><td>';
+        Dropdown::showFromArray('is_database_port', [
+            0 => __('No'),
+            1 => __('Yes — resolve to DatabaseInstance'),
+        ], [
+            'value' => $this->fields['is_database_port'] ?? 0,
+        ]);
+        echo '</td><td colspan="2"><em class="text-muted">'
+           . 'When locked, impact targets DatabaseInstance instead of Computer'
+           . '</em></td></tr>';
+
+        // Row 5: Comment
         echo '<tr><td>' . __('Comments') . '</td><td colspan="3">';
         echo '<textarea name="comment" rows="3" class="form-control">'
            . htmlspecialchars($this->fields['comment'] ?? '')

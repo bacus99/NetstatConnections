@@ -171,4 +171,78 @@ class PluginNetstatconnectionsResolver {
         return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_RES_RANGE) === false
             && filter_var($ip, FILTER_VALIDATE_IP) !== false;
     }
+
+    // ── Pillar 2: DatabaseInstance resolution ─────────────────────────
+
+    /**
+     * Given a resolved Computer/Cluster and a service port, check if a
+     * DatabaseInstance exists on that host for that port.
+     *
+     * @param string $itemtype  'Computer' or 'Cluster'
+     * @param int    $items_id  The host CI id
+     * @param int    $port      The service port (1433, 3306, etc.)
+     * @return array|null  ['id' => int, 'name' => string, 'itemtype' => string, 'items_id' => int] or null
+     */
+    public static function resolveToInstance(string $itemtype, int $items_id, int $port = 0): ?array {
+        global $DB;
+
+        if ($items_id <= 0) return null;
+        if (!$DB->tableExists('glpi_databaseinstances')) return null;
+
+        $where = [
+            'itemtype'   => $itemtype,
+            'items_id'   => $items_id,
+            'is_deleted' => 0,
+        ];
+
+        // If port is known, try exact match first
+        if ($port > 0) {
+            $exact = $DB->request(array_merge(
+                ['SELECT' => ['id', 'name', 'itemtype', 'items_id', 'port'], 'FROM' => 'glpi_databaseinstances', 'LIMIT' => 1],
+                ['WHERE' => array_merge($where, ['port' => (string)$port])]
+            ))->current();
+            if ($exact) {
+                return $exact;
+            }
+        }
+
+        // Fallback: any instance on this host (many SQL Server installs have empty port)
+        $any = $DB->request([
+            'SELECT' => ['id', 'name', 'itemtype', 'items_id', 'port'],
+            'FROM'   => 'glpi_databaseinstances',
+            'WHERE'  => $where,
+            'ORDER'  => ['id ASC'],
+            'LIMIT'  => 1,
+        ])->current();
+
+        return $any ?: null;
+    }
+
+    /**
+     * Pillar 3: Build the full impact chain for a DatabaseInstance.
+     * If the instance is hosted on a Cluster, returns the chain:
+     *   [source_computer] → DatabaseInstance → Cluster
+     *
+     * @return array  ['instance_id' => int, 'instance_name' => string,
+     *                 'host_type' => string, 'host_id' => int] or empty
+     */
+    public static function resolveInstanceChain(int $instance_id): array {
+        global $DB;
+
+        $inst = $DB->request([
+            'SELECT' => ['id', 'name', 'itemtype', 'items_id'],
+            'FROM'   => 'glpi_databaseinstances',
+            'WHERE'  => ['id' => $instance_id, 'is_deleted' => 0],
+            'LIMIT'  => 1,
+        ])->current();
+
+        if (!$inst) return [];
+
+        return [
+            'instance_id'   => (int)$inst['id'],
+            'instance_name' => $inst['name'],
+            'host_type'     => $inst['itemtype'],   // 'Computer' or 'Cluster'
+            'host_id'       => (int)$inst['items_id'],
+        ];
+    }
 }
