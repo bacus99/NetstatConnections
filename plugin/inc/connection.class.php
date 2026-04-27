@@ -70,12 +70,21 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
 
     // ── Inventory handler ────────────────────────────────────────────
 
+    /**
+     * Merge incoming connections with existing data (v1.3 lifecycle).
+     * Match by (computers_id + protocol + remote_addr + remote_port + process_name).
+     * - Existing match → UPDATE collected_at, last_seen, state (preserves created_at / age)
+     * - New row        → INSERT with connection_status = 'active'
+     * - Vanished rows  → UPDATE connection_status = 'closed' (NOT deleted)
+     * Locked rows are never touched.
+     */
     public static function handleInventory(int $computers_id, array $connections, string $collected_at): void {
         global $DB;
 
         if (!$DB->tableExists('glpi_plugin_netstatconnections_connections')) return;
         if (empty($connections)) return;
 
+        $seen_ids = [];
 
         foreach ($connections as $conn) {
             $protocol     = $conn['PROTOCOL']      ?? $conn['protocol']      ?? '';
@@ -104,9 +113,13 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     'collected_at'      => $collected_at,
                     'last_seen'         => date('Y-m-d H:i:s'),
                     'connection_status' => 'active',
-                    'state'             => $conn['STATE'] ?? $conn['state'] ?? '',
+                    'state'             => $conn['STATE']          ?? $conn['state']          ?? '',
+                    'local_addr'        => $conn['LOCAL_ADDR']     ?? $conn['local_addr']     ?? '',
+                    'local_port'        => (int)($conn['LOCAL_PORT'] ?? $conn['local_port']   ?? 0),
                     'remote_hostname'   => $conn['REMOTE_HOSTNAME'] ?? $conn['remote_hostname'] ?? null,
-                    'service_name'      => $conn['service_name'] ?? '',
+                    'service_name'      => $conn['service_name']   ?? '',
+                    'conn_direction'    => $conn['conn_direction']  ?? $conn['CONN_DIRECTION'] ?? null,
+                    'collection_method' => $conn['collection_method'] ?? null,
                 ], ['id' => (int)$existing['id']]);
                 continue;
             }
@@ -122,6 +135,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                 'process_name'     => $conn['PROCESS_NAME']   ?? $conn['process_name']   ?? '',
                 'service_name'     => $conn['service_name']                              ?? '',
                 'state'            => $conn['STATE']          ?? $conn['state']          ?? '',
+                'conn_direction'   => $conn['conn_direction']  ?? $conn['CONN_DIRECTION'] ?? null,
                 'collected_at'     => $collected_at,
                 'last_seen'        => date('Y-m-d H:i:s'),
                 'connection_status' => 'active',
@@ -208,6 +222,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                 FROM `{$table}`
                 WHERE computers_id = {$computers_id}
                   AND remote_port IN ({$ports_in})
+                  AND connection_status = 'active'
                 GROUP BY `{$table}`.protocol, `{$table}`.remote_port, `{$table}`.remote_addr, `{$table}`.process_name
 
                 UNION ALL
@@ -234,6 +249,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                 WHERE computers_id = {$computers_id}
                   AND local_port IN ({$ports_in})
                   AND remote_port NOT IN ({$ports_in})
+                  AND connection_status = 'active'
                 GROUP BY `{$table}`.protocol, `{$table}`.local_port, `{$table}`.remote_addr, `{$table}`.process_name
 
                 UNION ALL
@@ -262,6 +278,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                   AND local_port NOT IN ({$ports_in})
                   AND remote_port < {$ephemeral}
                   AND remote_port > 0
+                  AND connection_status = 'active'
                 GROUP BY `{$table}`.protocol, `{$table}`.remote_port, `{$table}`.remote_addr, `{$table}`.process_name
 
                 ORDER BY is_locked DESC, service_port ASC, remote_addr ASC
@@ -298,6 +315,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                   AND remote_addr != ''
                   AND remote_addr != '0.0.0.0'
                   AND remote_addr != '127.0.0.1'
+                  AND connection_status = 'active'
                 GROUP BY `{$table}`.protocol,
                     CASE WHEN `{$table}`.remote_port < {$ephemeral} THEN `{$table}`.remote_port WHEN `{$table}`.local_port < {$ephemeral} THEN `{$table}`.local_port ELSE `{$table}`.remote_port END,
                     `{$table}`.remote_addr, `{$table}`.process_name
@@ -315,12 +333,24 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
 
         $lock_url = Plugin::getWebDir('netstatconnections') . '/front/lock.php';
 
+        // Count closed connections for badge
+        $closed_count = countElementsInTable(
+            'glpi_plugin_netstatconnections_connections',
+            ['computers_id' => $computers_id, 'connection_status' => 'closed']
+        );
+
         echo '<div class="card m-3">';
         echo '<div class="card-header d-flex justify-content-between align-items-center">';
         echo '<h3 class="card-title mb-0">' . __('Network Connections', 'netstatconnections') . '</h3>';
+        echo '<div class="d-flex align-items-center gap-2">';
+        if ($closed_count > 0) {
+            echo '<span class="badge bg-secondary" title="Connections no longer seen — will be purged by cron">'
+               . $closed_count . ' closed</span>';
+        }
         if ($last_ts) {
             echo '<span class="text-muted" style="font-size:0.85em">Last collected: ' . Html::convDateTime($last_ts) . '</span>';
         }
+        echo '</div>';
         echo '</div>';
 
         if (empty($rows)) {

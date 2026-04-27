@@ -1,6 +1,6 @@
 # GLPI Network Connections Plugin
 
-**Version 1.2.0** — Network connection visibility, dependency mapping, and Impact Analysis integration for GLPI.
+**Version 1.3.0** — Network connection visibility, dependency mapping, and Impact Analysis integration for GLPI.
 
 Replicates ServiceNow-style service mapping via netstat collection: shows active TCP/UDP connections per computer, resolves IPs to GLPI CIs, auto-locks dependencies, and builds Impact Analysis graphs automatically.
 
@@ -9,14 +9,18 @@ Replicates ServiceNow-style service mapping via netstat collection: shows active
 ```
 Windows Server                          GLPI Server
 ┌──────────────────┐                   ┌──────────────────────────────┐
-│ glpi-netstat.bat  │    REST API      │ plugins/netstatconnections/  │
-│  └─ collect.pl    │ ──────────────►  │  ├─ connection.class.php     │
-│     (every 15min) │   delete+insert  │  ├─ resolver.class.php      │
-│                   │                  │  ├─ autolock.class.php       │
-│ netstat -ano      │                  │  └─ crontask.class.php       │
-│ + PowerShell      │                  │                              │
-│   process enrich  │                  │ ┌─ Impact Analysis ────────┐ │
-└──────────────────┘                   │ │ Computer A → Cluster B   │ │
+│ glpi-netstat.bat  │  1 POST (bulk)   │ plugins/netstatconnections/  │
+│  └─ collect.pl    │ ──────────────►  │  └─ front/push.php           │
+│     (every 15min) │   full payload   │     ├─ auth (session+token)  │
+│                   │                  │     ├─ handleInventory()     │
+│ PowerShell +      │                  │     │  ├─ match → UPDATE     │
+│   process enrich  │  ◄──────────── ─ │     │  ├─ new   → INSERT    │
+│                   │   stats JSON     │     │  ├─ gone  → 'closed'  │
+│                   │                  │     │  └─ auto-lock sweep   │
+└──────────────────┘                   │     └─ return stats          │
+                                       │                              │
+                                       │ ┌─ Impact Analysis ────────┐ │
+                                       │ │ Computer A → Cluster B   │ │
                                        │ │ Computer C → Computer D  │ │
                                        │ └─────────────────────────┘ │
                                        └──────────────────────────────┘
@@ -100,6 +104,7 @@ Check **Administration → Cron**:
 
 | Version | Date | Changes |
 |---------|------|---------|
+| **1.3.0** | 2026-04 | Pillar 1: Bulk push endpoint, connection lifecycle (mark closed not delete), `$seen_ids` fix |
 | **1.2.0** | 2026-04 | Inbound auto-lock fix, Port Definitions visual overhaul, lifecycle columns (DB ready), MySQL-compatible indexes |
 | **1.1.2** | 2026-04 | WMIC CSV parsing fix, lock by IP only, merge strategy preserving connection age |
 | **1.1.0** | 2026-04 | Cluster-first resolver, direction toggle, CommonDropdown for ports, cron tasks |
@@ -108,12 +113,11 @@ Check **Administration → Cron**:
 
 ## Roadmap
 
-### v1.3 — Connection Lifecycle + DatabaseInstance
+### v1.3 — Pillar 2+3 (next)
 
-- Mark vanished connections as `closed` instead of deleting (needs Symfony-routed push endpoint)
 - Auto-lock resolves to `DatabaseInstance` for SQL ports (not just Computer)
 - Cluster → Instance → Database chain in Impact Analysis
-- Fleet rollout packaging (GPO/SCCM deployment)
+- `is_database_port` flag on Port Definitions
 
 ### v1.4+ — Future
 

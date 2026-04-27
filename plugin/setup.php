@@ -1,19 +1,16 @@
 <?php
 /**
- * Plugin: netstatconnections v1.2.0
- * Network Connections tab + IP→CI resolver + Impact analysis + Auto-lock
+ * Plugin: netstatconnections v1.3.0
+ * Network Connections — lifecycle push, auto-lock, Impact Analysis
  *
- * Changelog 1.1.2:
- *   - Agent: WMIC CSV right-to-left parsing (CommandLine comma fix)
- *   - lock.php: lock by IP only (removed remote_port from WHERE)
- *   - lock.php: bidirectional _removeImpactRelation cleanup
- *   - port.class.php: rightname='dropdown' (port add fix)
- *   - resolver.class.php: resolved_via='unresolved' not 'none'
- *   - connection.class.php: unknown ports <49152 display
- *   - autolock.class.php: inline resolver for unresolved rows
+ * v1.3.0 — Pillar 1: Connection lifecycle via bulk push endpoint
+ *   - push.php: hardened auth (Session-Token + App-Token validation)
+ *   - handleInventory(): $seen_ids init fix, conn_direction in UPDATE/INSERT
+ *   - Agent: bulk push mode (single POST replaces delete+insert loop)
+ *   - Vanished connections marked 'closed' instead of deleted
  */
 
-define('PLUGIN_NETSTATCONNECTIONS_VERSION', '1.2.0');
+define('PLUGIN_NETSTATCONNECTIONS_VERSION', '1.3.0');
 define('PLUGIN_NETSTATCONNECTIONS_MIN_GLPI', '11.0.0');
 define('PLUGIN_NETSTATCONNECTIONS_MAX_GLPI', '12.0.0');
 

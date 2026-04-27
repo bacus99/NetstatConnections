@@ -26,7 +26,7 @@ use Getopt::Long;
 use Socket       qw(inet_aton AF_INET);
 use JSON::PP;
 
-our $VERSION = '2.0.0';
+our $VERSION = '2.1.0';
 
 # ---------------------------------------------------------------------------
 # Options
@@ -61,6 +61,7 @@ my %config = (
     skip_loopback            => 1,
     ephemeral_port_threshold => 49152,
     push_enabled             => 0,
+    push_mode                => 'bulk',
     glpi_url                 => '',
     app_token                => '',
     user_token               => '',
@@ -605,12 +606,201 @@ sub _pushToGLPI {
     $base =~ s{/+$}{};
     my $app_token  = $config{app_token};
     my $user_token = $config{user_token};
+    my $push_mode  = lc($config{push_mode} // 'bulk');
 
-    if ($OSNAME eq 'MSWin32') {
-        _pushViaPS($data, $base, $app_token, $user_token);
+    if ($push_mode eq 'bulk') {
+        info("Push mode: bulk (lifecycle merge via push.php)");
+        if ($OSNAME eq 'MSWin32') {
+            _pushViaBulkPS($data, $base, $app_token, $user_token);
+        } else {
+            _pushViaBulkCurl($data, $base, $app_token, $user_token);
+        }
     } else {
-        _pushViaCurl($data, $base, $app_token, $user_token);
+        info("Push mode: rest (legacy delete+insert via REST API)");
+        if ($OSNAME eq 'MSWin32') {
+            _pushViaPS($data, $base, $app_token, $user_token);
+        } else {
+            _pushViaCurl($data, $base, $app_token, $user_token);
+        }
     }
+}
+
+# ===========================================================================
+# Bulk push — single POST to push.php (v1.3 lifecycle merge)
+# ===========================================================================
+
+sub _pushViaBulkPS {
+    my ($data, $base, $app_token, $user_token) = @_;
+
+    my $tmp_json = File::Spec->catfile($vardir, 'netstat-push-payload.json');
+    open(my $jfh, '>', $tmp_json) or do { err("Cannot write $tmp_json: $!"); return; };
+    print $jfh encode_json($data);
+    close $jfh;
+
+    my $tmp_ps1 = File::Spec->catfile($vardir, 'netstat-bulk-push.ps1');
+    open(my $pfh, '>', $tmp_ps1) or do { err("Cannot write $tmp_ps1: $!"); return; };
+    print $pfh <<'PS1EOF';
+param([string]$JsonPath, [string]$BaseUrl, [string]$AppToken, [string]$UserToken)
+
+try {
+
+$payload = Get-Content -Raw $JsonPath | ConvertFrom-Json
+
+# Ignore SSL cert errors (self-signed)
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+        $code = 'using System.Net;using System.Net.Security;using System.Security.Cryptography.X509Certificates;public class TrustAllCertsPolicy:ICertificatePolicy{public bool CheckValidationResult(ServicePoint sp,X509Certificate cert,WebRequest req,int problem){return true;}}'
+        Add-Type -TypeDefinition $code
+    }
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+} catch {
+    Write-Host "BULK_WARN:SSL:$_"
+}
+
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+$headers = @{
+    'Content-Type'  = 'application/json'
+    'App-Token'     = $AppToken
+    'Authorization' = "user_token $UserToken"
+}
+
+# Init session
+$session = Invoke-RestMethod -Uri "$BaseUrl/apirest.php/initSession" -Headers $headers -Method Get
+$token   = $session.session_token
+if (-not $token) { Write-Host "BULK_ERROR:No_session_token"; exit 1 }
+
+$headers.Remove('Authorization')
+$headers['Session-Token'] = $token
+
+Write-Host "BULK_SESSION:$token"
+
+# POST entire payload to push.php
+$pushUrl = "$BaseUrl/plugins/netstatconnections/front/push.php"
+$body    = Get-Content -Raw $JsonPath
+
+try {
+    $resp = Invoke-RestMethod -Uri $pushUrl -Headers $headers -Method Post -Body $body -ContentType 'application/json'
+    if ($resp.status -eq 'ok') {
+        Write-Host "BULK_OK:pushed=$($resp.pushed),active=$($resp.stats.active),closed=$($resp.stats.closed),locked=$($resp.stats.locked),elapsed=$($resp.elapsed_ms)ms"
+    } else {
+        Write-Host "BULK_ERROR:status=$($resp.status),error=$($resp.error)"
+    }
+} catch {
+    $errMsg = $_.Exception.Message
+    $respBody = ''
+    try {
+        if ($_.Exception.Response) {
+            $stream = $_.Exception.Response.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($stream)
+            $respBody = $reader.ReadToEnd()
+            $reader.Close()
+            $stream.Close()
+        }
+    } catch {}
+    if ($respBody) {
+        Write-Host "BULK_ERROR:$errMsg BODY:$respBody"
+    } else {
+        Write-Host "BULK_ERROR:$errMsg"
+    }
+}
+
+# Kill session
+try { Invoke-RestMethod -Uri "$BaseUrl/apirest.php/killSession" -Headers $headers -Method Get | Out-Null } catch {}
+
+} catch {
+    Write-Host "BULK_FATAL:$($_.Exception.Message)"
+    exit 1
+}
+PS1EOF
+    close $pfh;
+
+    my $cmd = qq{powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass }
+        . qq{-File "$tmp_ps1" }
+        . qq{-JsonPath "$tmp_json" }
+        . qq{-BaseUrl "$base" }
+        . qq{-AppToken "$app_token" }
+        . qq{-UserToken "$user_token"};
+
+    my $output = `$cmd 2>&1`;
+    chomp $output;
+
+    for my $line (split /\n/, $output) {
+        $line =~ s/\r//g;
+        next unless $line =~ /\S/;
+        if ($line =~ /^BULK_OK:(.+)/) {
+            info("GLPI bulk push: $1");
+        } elsif ($line =~ /^BULK_FATAL:(.+)/) {
+            err("GLPI bulk push fatal: $1");
+        } elsif ($line =~ /^BULK_ERROR:(.+)/) {
+            err("GLPI bulk push error: $1");
+        } elsif ($line =~ /^BULK_SESSION:/) {
+            dbg("Session acquired");
+        } elsif ($line =~ /^BULK_WARN:(.+)/) {
+            dbg("GLPI bulk push warning: $1");
+        } else {
+            dbg("PS: $line");
+        }
+    }
+
+    unless ($output =~ /BULK_OK:/) {
+        err("GLPI bulk push: no BULK_OK line — push may have failed");
+        err("Full output: $output") if $output;
+    }
+
+    unlink $tmp_json;
+    unlink $tmp_ps1;
+}
+
+sub _pushViaBulkCurl {
+    my ($data, $base, $app_token, $user_token) = @_;
+
+    my $tmp_json = File::Spec->catfile($vardir, 'netstat-push-payload.json');
+    open(my $jfh, '>', $tmp_json) or do { err("Cannot write $tmp_json: $!"); return; };
+    print $jfh encode_json($data);
+    close $jfh;
+
+    # Init session
+    my $init_cmd = "curl -sk -X GET '$base/apirest.php/initSession' "
+        . "-H 'Content-Type: application/json' "
+        . "-H 'App-Token: $app_token' "
+        . "-H 'Authorization: user_token $user_token'";
+    my $init_out = `$init_cmd 2>/dev/null`;
+    chomp $init_out;
+
+    my $init_data = eval { decode_json($init_out) };
+    if (!$init_data || !$init_data->{session_token}) {
+        err("GLPI bulk initSession failed: $init_out");
+        unlink $tmp_json;
+        return;
+    }
+    my $session = $init_data->{session_token};
+    dbg("Session acquired: $session");
+
+    # POST to push.php
+    my $push_cmd = "curl -sk -X POST '$base/plugins/netstatconnections/front/push.php' "
+        . "-H 'Content-Type: application/json' "
+        . "-H 'App-Token: $app_token' "
+        . "-H 'Session-Token: $session' "
+        . "-d '\@$tmp_json'";
+    my $push_out = `$push_cmd 2>/dev/null`;
+    chomp $push_out;
+
+    my $push_data = eval { decode_json($push_out) };
+    if ($push_data && ($push_data->{status} // '') eq 'ok') {
+        my $s = $push_data->{stats} // {};
+        info(sprintf("GLPI bulk push: pushed=%d, active=%d, closed=%d, locked=%d, elapsed=%dms",
+            $push_data->{pushed} // 0,
+            $s->{active} // 0, $s->{closed} // 0, $s->{locked} // 0,
+            $push_data->{elapsed_ms} // 0));
+    } else {
+        err("GLPI bulk push failed: $push_out");
+    }
+
+    # Kill session
+    `curl -sk -X GET '$base/apirest.php/killSession' -H 'App-Token: $app_token' -H 'Session-Token: $session' 2>/dev/null`;
+
+    unlink $tmp_json;
 }
 
 sub _pushViaPS {

@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.3.0] — 2026-04-26
+
+### Plugin — Pillar 1: Connection Lifecycle
+- **`connection.class.php`**: Fixed `$seen_ids` array initialization (was undefined before loop — PHP notice on every push)
+- **`connection.class.php`**: UPDATE path now also refreshes `local_addr`, `local_port`, `conn_direction`, `collection_method` on existing rows (previously only state/hostname/service_name)
+- **`connection.class.php`**: INSERT path now includes `conn_direction` (was missing — caused NULLs)
+- **`connection.class.php`**: All 4 UNION display queries now filter `AND connection_status = 'active'` — closed rows no longer clutter the tab
+- **`connection.class.php`**: Card header shows "X closed" badge when vanished connections exist
+- **`push.php`**: Full rewrite — POST-only, App-Token validation against `glpi_apiclients`, session resume, JSON validation, try/catch around `handleInventory()`, returns stats (pushed/elapsed_ms/active/closed/locked)
+- **`setup.php`**: Version bump to 1.3.0
+
+### Agent — Bulk Push Mode
+- **Collector v2.1.0**: New `push_mode` config (`bulk` default, `rest` fallback)
+- **`_pushViaBulkPS()`**: Windows bulk push — single POST of full JSON payload to `push.php` instead of N individual REST API calls + delete loop
+- **`_pushViaBulkCurl()`**: Linux/curl equivalent
+- **`netstat-collect.ini`**: Added `push_mode = bulk` with documentation
+- **`Version.pm`**: Bumped to 1.3.0
+
+### Data Flow Change
+- **Before (v1.2)**: Agent → initSession → DELETE unlocked rows (N calls) → INSERT each row (N calls) → killSession. Vanished connections = gone forever.
+- **After (v1.3)**: Agent → initSession → POST full payload to push.php (1 call) → killSession. Vanished connections marked `closed`, purged by cron after retention period.
+
 ## [1.2.0] — 2026-04-22
 
 ### Plugin
