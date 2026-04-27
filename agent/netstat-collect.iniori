@@ -23,18 +23,22 @@ ephemeral_port_threshold = 49152
 [api]
 # GLPI server base URL (no trailing slash)
 # Example: https://glpi.transcontinental.ca/glpi
-glpi_url = https://glpi.transcontinental.ca/glpi
+glpi_url = https://glpi.example.com/glpi
 
 # GLPI REST API application token
 # Setup → General → API → Add application token
-app_token = jQWiQwUQ8dZ1A1onVw4vSRSHlXA8ZVJ8J6hfv0s9
+app_token = YOUR_APP_TOKEN_HERE
 
 # GLPI user API token (service account recommended)
 # My Settings → API token → Regenerate
-user_token = p9ne6PQTeyZm7uIWn07iV7aBcPktiGVr4UFS5Cq9
+user_token = YOUR_USER_TOKEN_HERE
 
 # Push data to GLPI REST API after collection (yes/no)
 push_enabled = yes
+
+# Push mode: 'bulk' (v1.3 lifecycle — single POST to push.php, marks closed)
+#             'rest' (v1.2 legacy — delete+insert per row via REST API)
+push_mode = bulk
 
 
 [exclude_processes]

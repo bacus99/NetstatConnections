@@ -1,29 +1,65 @@
 <?php
 /**
- * Bulk push endpoint for netstat collector — v1.3.2
- *
- * Session handling matches v1.2: bootstrap GLPI first (no session),
- * then session_id() + session_start() to resume the REST API session.
+ * Bulk push endpoint for netstat collector — v1.3.0
+ * Boots GLPI's Symfony kernel to get $DB, then calls handleInventory().
  */
 
-// ── Bootstrap GLPI (does not start a session by itself) ──────────────
-define('GLPI_ROOT', dirname(__DIR__, 3));
-include_once(GLPI_ROOT . '/inc/includes.php');
+// ── Boot GLPI Kernel (same as public/index.php) ──────────────────────
+$glpi_root = dirname(realpath(__FILE__) ?: __FILE__, 4);
+if (!file_exists($glpi_root . '/vendor/autoload.php')) {
+    $glpi_root = '/usr/share/glpi';
+}
+
+require_once $glpi_root . '/vendor/autoload.php';
+
+use Glpi\Kernel\Kernel;
+use Symfony\Component\HttpFoundation\Request;
+
+$kernel = new Kernel();
+$kernel->boot();
+
+global $DB;
+
+// If $DB is still null after boot, get it from the container
+if ($DB === null) {
+    try {
+        $container = $kernel->getContainer();
+        if ($container && $container->has('database')) {
+            $DB = $container->get('database');
+        }
+    } catch (\Throwable $e) {}
+}
+
+// Last resort: direct instantiation
+if ($DB === null) {
+    try { $DB = new DBmysql(); } catch (\Throwable $e) {}
+}
+
+if ($DB === null) {
+    http_response_code(500);
+    header('Content-Type: application/json');
+    echo json_encode(['error' => 'DB not available after kernel boot']);
+    exit;
+}
+
+// Close kernel's session so we can resume the agent's session
+if (session_status() === PHP_SESSION_ACTIVE) {
+    session_write_close();
+}
 
 ini_set('memory_limit', '256M');
 set_time_limit(300);
 header('Content-Type: application/json; charset=utf-8');
 
 // ── Only accept POST ─────────────────────────────────────────────────
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     http_response_code(405);
     echo json_encode(['error' => 'Method not allowed — use POST']);
     exit;
 }
 
-// ── Auth headers ─────────────────────────────────────────────────────
+// ── Auth: Session-Token ──────────────────────────────────────────────
 $session_token = $_SERVER['HTTP_SESSION_TOKEN'] ?? '';
-$app_token     = $_SERVER['HTTP_APP_TOKEN']     ?? '';
 
 if (empty($session_token)) {
     http_response_code(401);
@@ -31,29 +67,14 @@ if (empty($session_token)) {
     exit;
 }
 
-// ── Resume the REST API session (v1.2 pattern) ───────────────────────
+// Resume the agent's REST API session
 session_id($session_token);
 session_start();
 
 if (!isset($_SESSION['glpiID']) || empty($_SESSION['glpiID'])) {
     http_response_code(401);
-    echo json_encode(['error' => 'Invalid or expired session — call initSession first']);
+    echo json_encode(['error' => 'Invalid or expired session']);
     exit;
-}
-
-// ── Validate App-Token ───────────────────────────────────────────────
-if (!empty($app_token)) {
-    global $DB;
-    $api_client = $DB->request([
-        'FROM'  => 'glpi_apiclients',
-        'WHERE' => ['app_token' => $app_token, 'is_active' => 1],
-        'LIMIT' => 1,
-    ])->current();
-    if (!$api_client) {
-        http_response_code(401);
-        echo json_encode(['error' => 'Invalid or inactive App-Token']);
-        exit;
-    }
 }
 
 // ── Read & validate payload ──────────────────────────────────────────
@@ -73,7 +94,7 @@ if (json_last_error() !== JSON_ERROR_NONE) {
 
 if (!isset($data['connections']) || !is_array($data['connections'])) {
     http_response_code(400);
-    echo json_encode(['error' => 'Payload must contain a "connections" array']);
+    echo json_encode(['error' => 'Payload must contain a connections array']);
     exit;
 }
 
@@ -97,11 +118,7 @@ if (!empty($hostname)) {
 
 if ($computers_id === 0) {
     http_response_code(404);
-    echo json_encode([
-        'error'    => 'Computer not found',
-        'hostname' => $hostname,
-        'hint'     => 'Ensure this hostname matches a Computer name in GLPI (case-sensitive)',
-    ]);
+    echo json_encode(['error' => 'Computer not found', 'hostname' => $hostname]);
     exit;
 }
 
@@ -117,11 +134,7 @@ try {
     );
 } catch (\Throwable $e) {
     http_response_code(500);
-    echo json_encode([
-        'error'        => 'handleInventory failed',
-        'message'      => $e->getMessage(),
-        'computers_id' => $computers_id,
-    ]);
+    echo json_encode(['error' => 'handleInventory failed', 'message' => $e->getMessage()]);
     exit;
 }
 
@@ -129,25 +142,27 @@ $elapsed = round((microtime(true) - $t_start) * 1000);
 
 // ── Stats ────────────────────────────────────────────────────────────
 $stats = ['active' => 0, 'closed' => 0, 'locked' => 0];
-$stat_iter = $DB->request([
-    'SELECT' => [
-        'connection_status',
-        'is_locked',
-        new \Glpi\DBAL\QueryExpression('COUNT(*) AS cnt'),
-    ],
-    'FROM'    => 'glpi_plugin_netstatconnections_connections',
-    'WHERE'   => ['computers_id' => $computers_id],
-    'GROUPBY' => ['connection_status', 'is_locked'],
-]);
-foreach ($stat_iter as $s) {
-    if ((int)$s['is_locked'] === 1) $stats['locked'] += (int)$s['cnt'];
-    if ($s['connection_status'] === 'active') $stats['active'] += (int)$s['cnt'];
-    else $stats['closed'] += (int)$s['cnt'];
-}
+try {
+    $stat_iter = $DB->request([
+        'SELECT' => [
+            'connection_status',
+            'is_locked',
+            new \Glpi\DBAL\QueryExpression('COUNT(*) AS cnt'),
+        ],
+        'FROM'     => 'glpi_plugin_netstatconnections_connections',
+        'WHERE'    => ['computers_id' => $computers_id],
+        'GROUPBY'  => ['connection_status', 'is_locked'],
+    ]);
+    foreach ($stat_iter as $s) {
+        if ((int)$s['is_locked'] === 1) $stats['locked'] += (int)$s['cnt'];
+        if ($s['connection_status'] === 'active') $stats['active'] += (int)$s['cnt'];
+        else $stats['closed'] += (int)$s['cnt'];
+    }
+} catch (\Throwable $e) {}
 
 echo json_encode([
     'status'       => 'ok',
-    'version'      => '1.3.2',
+    'version'      => '1.3.0',
     'computers_id' => $computers_id,
     'hostname'     => $hostname,
     'pushed'       => $conn_count,

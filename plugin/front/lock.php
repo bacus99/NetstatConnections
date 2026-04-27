@@ -63,44 +63,39 @@ if ($direction === null) {
     $direction = ($connDir === 'inbound') ? 'depends' : 'impacts';
 }
 
-// ── Build WHERE for rows with same IP + service port + direction ──
-$svcPort = (int)($conn['service_port'] ?? 0);
-$connDir = $conn['conn_direction'] ?? 'outbound';
+// ── Build WHERE for all rows with same remote IP on this computer ──
 $where = [
     'computers_id'  => $computers_id,
     'remote_addr'   => $conn['remote_addr'],
-    'service_port'  => $svcPort,
-    'conn_direction'=> $connDir,
 ];
+
+// ── Determine service port + direction ──────────────────────────────
+$connDir = $conn['conn_direction'] ?? 'outbound';
+if ($connDir === '' || $connDir === null) {
+    // Fallback detection from port numbers
+    if (($conn['remote_port'] ?? 0) >= 49152 && ($conn['local_port'] ?? 0) < 49152) {
+        $connDir = 'inbound';
+    } else {
+        $connDir = 'outbound';
+    }
+}
+
+$svcPort = ($connDir === 'inbound')
+    ? (int)($conn['local_port'] ?? 0)
+    : (int)($conn['remote_port'] ?? 0);
+if ($svcPort === 0) {
+    $svcPort = min((int)($conn['local_port'] ?? 65535), (int)($conn['remote_port'] ?? 65535));
+}
 
 // ── Lock / Unlock ────────────────────────────────────────────────────
 
 $update = [
     'is_locked'        => $locked,
-    'impact_direction' => $direction,
+    'impact_direction' => $locked ? $direction : '',
+    'service_port'     => $locked ? $svcPort : 0,
 ];
 
 $DB->update('glpi_plugin_netstatconnections_connections', $update, $where);
-
-// ── Determine connection direction (inbound vs outbound) ─────────────
-$connDir = 'outbound';
-if (($conn['remote_port'] ?? 0) >= 49152
-    && ($conn['local_port'] ?? 0) < 49152
-) {
-    $connDir = 'inbound';
-}
-
-// ── Service port for label ───────────────────────────────────────────
-$svcPort = ($connDir === 'inbound')
-    ? (int)($conn['local_port'] ?? 0)
-    : (int)($conn['remote_port'] ?? 0);
-
-if ($svcPort === 0) {
-    $svcPort = min(
-        (int)($conn['local_port'] ?? 65535),
-        (int)($conn['remote_port'] ?? 65535)
-    );
-}
 
 $port_label = PluginNetstatconnectionsPort::getBadgeLabel($svcPort, $conn['protocol'] ?? 'TCP');
 

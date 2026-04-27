@@ -634,12 +634,7 @@ sub _pushViaBulkPS {
 
     my $tmp_json = File::Spec->catfile($vardir, 'netstat-push-payload.json');
     open(my $jfh, '>', $tmp_json) or do { err("Cannot write $tmp_json: $!"); return; };
-    print $jfh encode_json({
-        hostname          => $data->{hostname},
-        collected_at      => $data->{collected_at},
-        collection_method => $data->{collection_method},
-        connections       => $data->{connections},
-    });
+    print $jfh encode_json($data);
     close $jfh;
 
     my $tmp_ps1 = File::Spec->catfile($vardir, 'netstat-bulk-push.ps1');
@@ -680,35 +675,74 @@ $headers['Session-Token'] = $token
 
 Write-Host "BULK_SESSION:$token"
 
-# POST entire payload to push.php
-$pushUrl   = "$BaseUrl/plugins/netstatconnections/front/push.php"
-$bodyBytes = [System.Text.Encoding]::UTF8.GetBytes((Get-Content -Raw $JsonPath))
+# POST entire payload to push.php using HttpWebRequest
+# (Invoke-RestMethod has known issues with SSL + large POST on some .NET versions)
+$pushUrl = "$BaseUrl/plugins/netstatconnections/front/push.php"
 
-# Remove Content-Type from headers — pass it only via -ContentType to avoid duplicates
-$postHeaders = $headers.Clone()
-$postHeaders.Remove('Content-Type')
+# Disable Expect: 100-continue globally
+[System.Net.ServicePointManager]::Expect100Continue = $false
+
+# Get payload size for logging
+$bodyBytes = [System.IO.File]::ReadAllBytes($JsonPath)
+Write-Host "BULK_PAYLOAD:size=$($bodyBytes.Length)bytes"
 
 try {
-    $wresp    = Invoke-WebRequest -Uri $pushUrl -Headers $postHeaders -Method Post `
-                    -Body $bodyBytes -ContentType 'application/json' -UseBasicParsing
-    $resp     = $wresp.Content | ConvertFrom-Json
+    $webReq = [System.Net.HttpWebRequest]::Create($pushUrl)
+    $webReq.Method = 'POST'
+    $webReq.ContentType = 'application/json; charset=utf-8'
+    $webReq.ContentLength = $bodyBytes.Length
+    $webReq.Timeout = 300000          # 300 sec
+    $webReq.ReadWriteTimeout = 300000
+    $webReq.KeepAlive = $true
+    $webReq.ServicePoint.Expect100Continue = $false
+    $webReq.Headers.Add('App-Token', $AppToken)
+    $webReq.Headers.Add('Session-Token', $token)
+
+    # Accept any SSL cert (self-signed)
+    $webReq.ServerCertificateValidationCallback = { $true }
+
+    # Write body
+    $reqStream = $webReq.GetRequestStream()
+    $reqStream.Write($bodyBytes, 0, $bodyBytes.Length)
+    $reqStream.Flush()
+    $reqStream.Close()
+
+    # Read response
+    $webResp = $webReq.GetResponse()
+    $respStream = $webResp.GetResponseStream()
+    $reader = New-Object System.IO.StreamReader($respStream)
+    $respText = $reader.ReadToEnd()
+    $reader.Close()
+    $respStream.Close()
+    $httpCode = [int]$webResp.StatusCode
+    $webResp.Close()
+
+    Write-Host "BULK_HTTP:$httpCode"
+
+    $resp = $respText | ConvertFrom-Json
     if ($resp.status -eq 'ok') {
         Write-Host "BULK_OK:pushed=$($resp.pushed),active=$($resp.stats.active),closed=$($resp.stats.closed),locked=$($resp.stats.locked),elapsed=$($resp.elapsed_ms)ms"
     } else {
-        Write-Host "BULK_ERROR:HTTP=$($wresp.StatusCode) status=$($resp.status) error=$($resp.error)"
+        Write-Host "BULK_ERROR:status=$($resp.status),error=$($resp.error)"
     }
 } catch [System.Net.WebException] {
-    $sc = ''
-    $rb = ''
-    try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
+    $ex = $_.Exception
+    $httpCode = 0
+    $respBody = ''
     try {
-        $st = $_.Exception.Response.GetResponseStream()
-        $rd = New-Object System.IO.StreamReader($st)
-        $rb = $rd.ReadToEnd(); $rd.Close(); $st.Close()
+        if ($ex.Response) {
+            $httpCode = [int]$ex.Response.StatusCode
+            $errStream = $ex.Response.GetResponseStream()
+            $errReader = New-Object System.IO.StreamReader($errStream)
+            $respBody = $errReader.ReadToEnd()
+            $errReader.Close()
+            $errStream.Close()
+            $ex.Response.Close()
+        }
     } catch {}
-    Write-Host "BULK_ERROR:HTTP=$sc msg=$($_.Exception.Message) body=$rb"
+    Write-Host "BULK_ERROR:HTTP=$httpCode msg=$($ex.Message) body=$respBody"
 } catch {
-    Write-Host "BULK_ERROR:$($_.Exception.Message)"
+    Write-Host "BULK_ERROR:HTTP=0 msg=$($_.Exception.Message) body="
 }
 
 # Kill session
@@ -736,6 +770,10 @@ PS1EOF
         next unless $line =~ /\S/;
         if ($line =~ /^BULK_OK:(.+)/) {
             info("GLPI bulk push: $1");
+        } elsif ($line =~ /^BULK_PAYLOAD:(.+)/) {
+            info("GLPI bulk push: $1");
+        } elsif ($line =~ /^BULK_HTTP:(\d+)/) {
+            dbg("GLPI bulk push: HTTP $1");
         } elsif ($line =~ /^BULK_FATAL:(.+)/) {
             err("GLPI bulk push fatal: $1");
         } elsif ($line =~ /^BULK_ERROR:(.+)/) {
@@ -763,12 +801,7 @@ sub _pushViaBulkCurl {
 
     my $tmp_json = File::Spec->catfile($vardir, 'netstat-push-payload.json');
     open(my $jfh, '>', $tmp_json) or do { err("Cannot write $tmp_json: $!"); return; };
-    print $jfh encode_json({
-        hostname          => $data->{hostname},
-        collected_at      => $data->{collected_at},
-        collection_method => $data->{collection_method},
-        connections       => $data->{connections},
-    });
+    print $jfh encode_json($data);
     close $jfh;
 
     # Init session

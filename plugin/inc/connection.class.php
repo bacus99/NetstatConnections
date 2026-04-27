@@ -71,6 +71,25 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
     // ── Inventory handler ────────────────────────────────────────────
 
     /**
+     * Parse various datetime formats into MySQL Y-m-d H:i:s.
+     * Handles: "4/15/2026 11:00:05 PM", "2026-04-15T23:00:05", ISO, etc.
+     */
+    private static function parseDateTime(string $val): string {
+        $val = trim($val);
+        if ($val === '') {
+            return date('Y-m-d H:i:s');
+        }
+        if (preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $val)) {
+            return $val;
+        }
+        $ts = strtotime($val);
+        if ($ts !== false && $ts > 0) {
+            return date('Y-m-d H:i:s', $ts);
+        }
+        return date('Y-m-d H:i:s');
+    }
+
+    /**
      * Merge incoming connections with existing data (v1.3 lifecycle).
      * Match by (computers_id + protocol + remote_addr + remote_port + process_name).
      * - Existing match → UPDATE collected_at, last_seen, state (preserves created_at / age)
@@ -92,9 +111,9 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
             $remote_port  = (int)($conn['REMOTE_PORT'] ?? $conn['remote_port'] ?? 0);
             $process_name = $conn['PROCESS_NAME']   ?? $conn['process_name']  ?? '';
 
-            // Match existing unlocked row
+            // Match existing row (locked OR unlocked)
             $existing = $DB->request([
-                'SELECT' => ['id'],
+                'SELECT' => ['id', 'is_locked'],
                 'FROM'   => 'glpi_plugin_netstatconnections_connections',
                 'WHERE'  => [
                     'computers_id' => $computers_id,
@@ -102,25 +121,34 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     'remote_addr'  => $remote_addr,
                     'remote_port'  => $remote_port,
                     'process_name' => $process_name,
-                    'is_locked'    => 0,
                 ],
                 'LIMIT' => 1,
             ])->current();
 
             if ($existing) {
                 $seen_ids[] = (int)$existing['id'];
-                $DB->update('glpi_plugin_netstatconnections_connections', [
-                    'collected_at'      => $collected_at,
-                    'last_seen'         => date('Y-m-d H:i:s'),
-                    'connection_status' => 'active',
-                    'state'             => $conn['STATE']          ?? $conn['state']          ?? '',
-                    'local_addr'        => $conn['LOCAL_ADDR']     ?? $conn['local_addr']     ?? '',
-                    'local_port'        => (int)($conn['LOCAL_PORT'] ?? $conn['local_port']   ?? 0),
-                    'remote_hostname'   => $conn['REMOTE_HOSTNAME'] ?? $conn['remote_hostname'] ?? null,
-                    'service_name'      => $conn['service_name']   ?? '',
-                    'conn_direction'    => $conn['conn_direction']  ?? $conn['CONN_DIRECTION'] ?? null,
-                    'collection_method' => $conn['collection_method'] ?? null,
-                ], ['id' => (int)$existing['id']]);
+
+                // Only update unlocked rows — locked rows keep their state
+                if ((int)$existing['is_locked'] === 0) {
+                    $DB->update('glpi_plugin_netstatconnections_connections', [
+                        'collected_at'      => $collected_at,
+                        'last_seen'         => date('Y-m-d H:i:s'),
+                        'connection_status' => 'active',
+                        'state'             => $conn['STATE']          ?? $conn['state']          ?? '',
+                        'local_addr'        => $conn['LOCAL_ADDR']     ?? $conn['local_addr']     ?? '',
+                        'local_port'        => (int)($conn['LOCAL_PORT'] ?? $conn['local_port']   ?? 0),
+                        'remote_hostname'   => $conn['REMOTE_HOSTNAME'] ?? $conn['remote_hostname'] ?? '',
+                        'service_name'      => $conn['service_name']   ?? '',
+                        'conn_direction'    => $conn['conn_direction']  ?? $conn['CONN_DIRECTION'] ?? 'outbound',
+                        'collection_method' => $conn['collection_method'] ?? '',
+                    ], ['id' => (int)$existing['id']]);
+                } else {
+                    // Locked row: only touch last_seen (proves it's still alive)
+                    $DB->update('glpi_plugin_netstatconnections_connections', [
+                        'last_seen'         => date('Y-m-d H:i:s'),
+                        'connection_status' => 'active',
+                    ], ['id' => (int)$existing['id']]);
+                }
                 continue;
             }
 
@@ -131,18 +159,18 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                 'local_port'       => (int)($conn['LOCAL_PORT']   ?? $conn['local_port']  ?? 0),
                 'remote_addr'      => $remote_addr,
                 'remote_port'      => $remote_port,
-                'remote_hostname'  => $conn['REMOTE_HOSTNAME'] ?? $conn['remote_hostname'] ?? null,
+                'remote_hostname'  => $conn['REMOTE_HOSTNAME'] ?? $conn['remote_hostname'] ?? '',
                 'process_name'     => $conn['PROCESS_NAME']   ?? $conn['process_name']   ?? '',
                 'service_name'     => $conn['service_name']                              ?? '',
                 'state'            => $conn['STATE']          ?? $conn['state']          ?? '',
-                'conn_direction'   => $conn['conn_direction']  ?? $conn['CONN_DIRECTION'] ?? null,
+                'conn_direction'   => $conn['conn_direction']  ?? $conn['CONN_DIRECTION'] ?? 'outbound',
                 'collected_at'     => $collected_at,
                 'last_seen'        => date('Y-m-d H:i:s'),
                 'connection_status' => 'active',
-                'created_at'       => $conn['created_at']     ?? null,
-                'collection_method'=> $conn['collection_method'] ?? null,
-                'offload_state'    => $conn['offload_state']  ?? null,
-                'applied_setting'  => $conn['applied_setting'] ?? null,
+                'created_at'       => self::parseDateTime($conn['created_at'] ?? ''),
+                'collection_method'=> $conn['collection_method'] ?? '',
+                'offload_state'    => $conn['offload_state']  ?? '',
+                'applied_setting'  => $conn['applied_setting'] ?? '',
                 'is_locked'        => 0,
             ]);
             if ($new_id) { $seen_ids[] = (int)$new_id; }
