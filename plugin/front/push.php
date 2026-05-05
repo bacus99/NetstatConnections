@@ -58,12 +58,38 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     exit;
 }
 
-// ── Auth: Session-Token ──────────────────────────────────────────────
+// ── Auth ─────────────────────────────────────────────────────────────
+// Option A: X-NetStat-Token (GLPI Agent Perl module — no session needed)
+$netstat_token = $_SERVER['HTTP_X_NETSTAT_TOKEN'] ?? '';
+
+if (!empty($netstat_token)) {
+    // Validate against push_token stored in plugin config table
+    $valid_token = '';
+    try {
+        $cfg_row = $DB->request([
+            'SELECT' => ['value'],
+            'FROM'   => 'glpi_plugin_netstatconnections_config',
+            'WHERE'  => ['key' => 'push_token'],
+            'LIMIT'  => 1,
+        ])->current();
+        $valid_token = $cfg_row['value'] ?? '';
+    } catch (\Throwable $e) {}
+
+    if (empty($valid_token) || !hash_equals($valid_token, $netstat_token)) {
+        http_response_code(401);
+        echo json_encode(['error' => 'Invalid X-NetStat-Token']);
+        exit;
+    }
+    // Token is valid — skip session auth
+    goto auth_ok;
+}
+
+// Option B: Session-Token (GLPI REST API session — legacy bat/script auth)
 $session_token = $_SERVER['HTTP_SESSION_TOKEN'] ?? '';
 
 if (empty($session_token)) {
     http_response_code(401);
-    echo json_encode(['error' => 'Missing Session-Token header']);
+    echo json_encode(['error' => 'Missing authentication — provide X-NetStat-Token or Session-Token header']);
     exit;
 }
 
@@ -76,6 +102,8 @@ if (!isset($_SESSION['glpiID']) || empty($_SESSION['glpiID'])) {
     echo json_encode(['error' => 'Invalid or expired session']);
     exit;
 }
+
+auth_ok:
 
 // ── Read & validate payload ──────────────────────────────────────────
 $body = file_get_contents('php://input');

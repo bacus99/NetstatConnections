@@ -238,10 +238,6 @@ class PluginNetstatconnectionsAutolock {
                 }
             }
 
-            // Clean both directions first
-            self::removeImpactRelation('Computer', $computers_id, $impact_target_type, $impact_target_id);
-            self::removeImpactRelation($impact_target_type, $impact_target_id, 'Computer', $computers_id);
-
             if ($direction === 'impacts') {
                 // Remote impacts us (if remote goes down, we break)
                 $src_type = $impact_target_type; $src_id = $impact_target_id;
@@ -252,17 +248,24 @@ class PluginNetstatconnectionsAutolock {
                 $dst_type = $impact_target_type; $dst_id = $impact_target_id;
             }
 
+            // Build accumulated name from ALL currently-locked connections to this CI.
+            // Only remove the wrong-direction relation — never wipe the forward one,
+            // as it would erase previously accumulated port labels.
+            $accumulated_label = self::buildImpactName($computers_id, $impact_target_type, $impact_target_id);
+            if ($accumulated_label === '') $accumulated_label = $label;
+
+            self::removeImpactRelation($dst_type, $dst_id, $src_type, $src_id);   // wrong direction only
+
             self::ensureImpactItem($src_type, $src_id);
             self::ensureImpactItem($dst_type, $dst_id);
-            self::ensureImpactRelation($src_type, $src_id, $dst_type, $dst_id, $label);
+            self::setImpactRelation($src_type, $src_id, $dst_type, $dst_id, $accumulated_label);
 
-            // ── Pillar 3: Chain — DatabaseInstance → Cluster ─────────
+            // ── Pillar 3: Host → DatabaseInstance (host failure takes down the instance)
             if ($chain_host_id > 0 && !empty($chain_host_type)) {
                 self::ensureImpactItem($chain_host_type, $chain_host_id);
-                // Instance → Cluster (the instance depends on the cluster)
                 self::ensureImpactRelation(
-                    'DatabaseInstance', $impact_target_id,
                     $chain_host_type, $chain_host_id,
+                    'DatabaseInstance', $impact_target_id,
                     $label . ' (host)'
                 );
             }
@@ -302,24 +305,69 @@ class PluginNetstatconnectionsAutolock {
         }
     }
 
+    /**
+     * Build a sorted, comma-separated list of port labels for all locked
+     * connections from $computers_id to the given remote CI.
+     * Called before creating/updating an impact relation so the name always
+     * reflects the full set of locked ports, not just the most recent one.
+     */
+    private static function buildImpactName(int $computers_id, string $remote_type, int $remote_id): string {
+        global $DB;
+        if ($computers_id <= 0 || $remote_id <= 0) return '';
+
+        $rows = $DB->request([
+            'SELECT' => ['service_port', 'protocol'],
+            'FROM'   => 'glpi_plugin_netstatconnections_connections',
+            'WHERE'  => [
+                'computers_id'    => $computers_id,
+                'remote_items_id' => $remote_id,
+                'remote_itemtype' => $remote_type,
+                'is_locked'       => 1,
+            ],
+        ]);
+        $labels = [];
+        foreach ($rows as $r) {
+            $label = self::getPortLabel((int)($r['service_port'] ?? 0), $r['protocol'] ?? 'TCP');
+            if ($label !== '' && !in_array($label, $labels, true)) {
+                $labels[] = $label;
+            }
+        }
+        sort($labels);
+        return implode(', ', $labels);
+    }
+
+    /** Upsert an impact relation with an exact pre-computed name (no append). */
+    private static function setImpactRelation(string $src_type, int $src_id, string $dst_type, int $dst_id, string $name): void {
+        global $DB;
+        $where = [
+            'itemtype_source'   => $src_type, 'items_id_source'   => $src_id,
+            'itemtype_impacted' => $dst_type, 'items_id_impacted' => $dst_id,
+        ];
+        $exists = $DB->request(['FROM' => 'glpi_impactrelations', 'WHERE' => $where, 'LIMIT' => 1])->current();
+        if ($exists) {
+            $DB->update('glpi_impactrelations', ['name' => $name], $where);
+        } else {
+            $DB->insert('glpi_impactrelations', array_merge($where, ['name' => $name]));
+        }
+    }
+
     private static function ensureImpactRelation(string $src_type, int $src_id, string $dst_type, int $dst_id, string $name): void {
         global $DB;
-        $exists = $DB->request([
-            'FROM'  => 'glpi_impactrelations',
-            'WHERE' => [
-                'itemtype_source'   => $src_type, 'items_id_source'   => $src_id,
-                'itemtype_impacted' => $dst_type, 'items_id_impacted' => $dst_id,
-            ],
-            'LIMIT' => 1,
-        ])->current();
+        $where = [
+            'itemtype_source'   => $src_type, 'items_id_source'   => $src_id,
+            'itemtype_impacted' => $dst_type, 'items_id_impacted' => $dst_id,
+        ];
+        $exists = $DB->request(['FROM' => 'glpi_impactrelations', 'WHERE' => $where, 'LIMIT' => 1])->current();
         if (!$exists) {
-            $DB->insert('glpi_impactrelations', [
-                'itemtype_source'   => $src_type,
-                'items_id_source'   => $src_id,
-                'itemtype_impacted' => $dst_type,
-                'items_id_impacted' => $dst_id,
-                'name'              => $name,
-            ]);
+            $DB->insert('glpi_impactrelations', array_merge($where, ['name' => $name]));
+        } else {
+            // Append the new port label if not already present in the name
+            $parts = array_values(array_filter(array_map('trim', explode(',', $exists['name'] ?? ''))));
+            if (!in_array($name, $parts, true)) {
+                $parts[] = $name;
+                sort($parts);
+                $DB->update('glpi_impactrelations', ['name' => implode(', ', $parts)], $where);
+            }
         }
     }
 

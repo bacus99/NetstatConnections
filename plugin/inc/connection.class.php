@@ -359,7 +359,23 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
 
         // ── Render HTML ──────────────────────────────────────────────
 
-        $lock_url = Plugin::getWebDir('netstatconnections') . '/front/lock.php';
+        $lock_url      = Plugin::getWebDir('netstatconnections') . '/front/lock.php';
+        $bulk_lock_url = Plugin::getWebDir('netstatconnections') . '/front/bulk_lock.php';
+
+        // ── Pre-compute inbound groups for bulk-lock headers ─────────
+        // Key: direction|protocol|service_port  → total / locked counts
+        $group_meta = [];
+        foreach ($rows as $r) {
+            $gk = ($r['direction'] ?? 'out') . '|' . ($r['protocol'] ?? 'TCP') . '|' . (int)($r['service_port'] ?? 0);
+            if (!isset($group_meta[$gk])) {
+                $group_meta[$gk] = ['total' => 0, 'locked' => 0,
+                                    'direction'    => $r['direction']    ?? 'out',
+                                    'protocol'     => $r['protocol']     ?? 'TCP',
+                                    'service_port' => (int)($r['service_port'] ?? 0)];
+            }
+            $group_meta[$gk]['total']++;
+            if ((int)$r['is_locked']) $group_meta[$gk]['locked']++;
+        }
 
         // Count closed connections for badge
         $closed_count = countElementsInTable(
@@ -401,6 +417,8 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
         echo '</tr></thead>';
         echo '<tbody>';
 
+        $prev_gkey = null;
+
         foreach ($rows as $conn) {
             $id        = (int)$conn['id'];
             $locked    = (int)$conn['is_locked'];
@@ -408,6 +426,44 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
             $svcPort   = (int)($conn['service_port'] ?? 0);
             $proto     = $conn['protocol'] ?? 'TCP';
             $direction = $locked ? ($conn['impact_direction'] ?? 'impacts') : 'impacts';
+
+            // ── Inbound group header (injected once per unique inbound port) ──
+            $gkey = $dir . '|' . $proto . '|' . $svcPort;
+            if ($dir === 'in' && $gkey !== $prev_gkey) {
+                $prev_gkey = $gkey;
+                $g = $group_meta[$gkey] ?? ['total' => 1, 'locked' => 0];
+                if ($g['total'] >= 2) {
+                    $all_locked  = ($g['locked'] === $g['total']);
+                    $some_locked = ($g['locked'] > 0);
+                    $btn_locked  = $all_locked ? 0 : 1;
+                    $btn_label   = $all_locked
+                        ? '<i class="ti ti-lock-open me-1"></i>Unlock all inbound'
+                        : '<i class="ti ti-lock me-1"></i>Lock all inbound';
+                    $btn_class   = $all_locked ? 'btn-outline-warning' : 'btn-outline-primary';
+
+                    $lock_summary = '';
+                    if ($some_locked && !$all_locked) {
+                        $lock_summary = ' <small class="text-muted ms-1">(' . $g['locked'] . '/' . $g['total'] . ' locked)</small>';
+                    }
+
+                    echo '<tr class="table-light border-top-2" style="border-top:2px solid #dee2e6">';
+                    echo '<td colspan="8" class="py-1 px-3 d-flex align-items-center">';
+                    echo '<span class="fw-semibold text-primary me-2">';
+                    echo '◀ Inbound ' . PluginNetstatconnectionsPort::getBadge($svcPort, $proto);
+                    echo ' — ' . $g['total'] . ' client' . ($g['total'] > 1 ? 's' : '');
+                    echo $lock_summary;
+                    echo '</span>';
+                    echo '<button class="btn btn-sm ' . $btn_class . ' ms-auto netstat-bulk-lock"'
+                        . ' data-computers-id="' . $computers_id . '"'
+                        . ' data-local-port="' . $svcPort . '"'
+                        . ' data-protocol="' . htmlspecialchars($proto) . '"'
+                        . ' data-locked="' . $btn_locked . '">'
+                        . $btn_label . '</button>';
+                    echo '</td></tr>';
+                }
+            } elseif ($dir !== 'in') {
+                $prev_gkey = null;   // reset so next inbound group gets a header
+            }
 
             // Direction arrow
             $dir_icon  = ($dir === 'in')
@@ -431,6 +487,11 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     if ($remote_itemtype === 'DatabaseInstance') {
                         $host_type = $item_obj->fields['itemtype'] ?? '';
                         $host_id   = (int)($item_obj->fields['items_id'] ?? 0);
+                        // Fallback: some GLPI versions use computers_id directly
+                        if ($host_id === 0) {
+                            $host_type = 'Computer';
+                            $host_id   = (int)($item_obj->fields['computers_id'] ?? 0);
+                        }
                         if ($host_id > 0 && $host_type) {
                             $host_obj = new $host_type();
                             if ($host_obj->getFromDB($host_id)) {
@@ -511,13 +572,16 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
         // ── JavaScript ───────────────────────────────────────────────
 
         echo '<script>
+        const _lockUrl     = ' . json_encode($lock_url)      . ';
+        const _bulkLockUrl = ' . json_encode($bulk_lock_url) . ';
+
         document.querySelectorAll(".netstat-lock").forEach(cb => {
             cb.addEventListener("change", function() {
                 const id      = this.dataset.id;
                 const cid     = this.dataset.computersId;
                 const addr    = this.dataset.remoteAddr;
                 const locked  = this.checked ? 1 : 0;
-                fetch("' . $lock_url . '?id=" + id + "&locked=" + locked
+                fetch(_lockUrl + "?id=" + id + "&locked=" + locked
                     + "&computers_id=" + cid + "&remote_addr=" + encodeURIComponent(addr) + "&ajax=1")
                     .then(r => r.json())
                     .then(() => location.reload());
@@ -530,10 +594,45 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                 const cid  = this.dataset.computersId;
                 const curr = this.dataset.direction;
                 const next = (curr === "impacts") ? "depends" : "impacts";
-                fetch("' . $lock_url . '?id=" + id + "&locked=1"
+                fetch(_lockUrl + "?id=" + id + "&locked=1"
                     + "&computers_id=" + cid + "&direction=" + next + "&change_direction=1&ajax=1")
                     .then(r => r.json())
                     .then(() => location.reload());
+            });
+        });
+
+        document.querySelectorAll(".netstat-bulk-lock").forEach(btn => {
+            btn.addEventListener("click", function() {
+                const cid    = this.dataset.computersId;
+                const port   = this.dataset.localPort;
+                const proto  = this.dataset.protocol;
+                const lock   = this.dataset.locked;
+                const label  = this.innerHTML;
+
+                this.disabled   = true;
+                this.innerHTML  = \'<span class="spinner-border spinner-border-sm me-1"></span>Working…\';
+
+                fetch(_bulkLockUrl
+                    + "?computers_id=" + cid
+                    + "&local_port="   + port
+                    + "&protocol="     + encodeURIComponent(proto)
+                    + "&locked="       + lock
+                    + "&ajax=1")
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.success) {
+                            location.reload();
+                        } else {
+                            alert("Bulk lock error: " + (data.error || "unknown"));
+                            this.disabled  = false;
+                            this.innerHTML = label;
+                        }
+                    })
+                    .catch(err => {
+                        alert("Request failed: " + err);
+                        this.disabled  = false;
+                        this.innerHTML = label;
+                    });
             });
         });
         </script>';

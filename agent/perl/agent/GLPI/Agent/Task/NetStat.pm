@@ -1,649 +1,245 @@
-package GLPI::Agent::Tools::NetStat;
+package GLPI::Agent::Task::NetStat;
 
 =head1 NAME
 
-GLPI::Agent::Tools::NetStat - Network connection collection via PowerShell / ss
+GLPI::Agent::Task::NetStat - RESERVED library — do NOT deploy with Version.pm
+
+=head1 WARNING
+
+Do NOT install NetStat/Version.pm alongside this file on the GLPI Agent.
+
+If Version.pm is present, the agent advertises "netstat" as an installed task
+in its contact to the GlpiInventory server. GlpiInventory does not know that
+task type and returns 400 Bad Request, which breaks ALL tasks including Inventory
+and RemoteInventory.
+
+Connection collection runs through:
+  Task/Inventory/Generic/Connections.pm   (Inventory module — no new task type)
 
 =head1 DESCRIPTION
 
-Collects active TCP/UDP connections, listening ports, and running processes.
+Library code kept for reference. The actual push logic lives in Connections.pm.
 
-Windows: Uses PowerShell Get-NetTCPConnection + Get-NetUDPEndpoint (structured
-objects with CreationTime, OffloadState). Falls back to netstat -ano on
-Server 2008 R2 / PowerShell < 4.0.
+=head1 CONFIGURATION
 
-Also detects HTTP.SYS-managed ports via netsh and remaps PID 4 (System)
-connections to a synthetic "HTTP.SYS" process (PID 5) — same convention as
-SquaredUp DataOnDemand MP.
+Create C:\Program Files\GLPI-Agent\etc\conf.d\netstat.cfg :
 
-Linux: Uses ss -tunap, falls back to netstat -tunap.
-
-=head1 VERSION
-
-2.0.0 — PowerShell-first rewrite
+    push_url   = https://glpi.example.com/glpi/plugins/netstatconnections/front/push.php
+    push_token = <token shown in GLPI > Plugins > Network Connections>
 
 =cut
 
 use strict;
 use warnings;
-use English qw(-no_match_vars);
-use Socket qw(inet_aton AF_INET);
-use base 'Exporter';
 
-use GLPI::Agent::Tools qw(
-    getAllLines
-    canRun
-);
+use parent 'GLPI::Agent::Task';
 
-our $VERSION = '2.0.0';
+use English    qw(-no_match_vars);
+use HTTP::Request;
+use LWP::UserAgent;
+use Encode     qw(encode);
+use Sys::Hostname;
 
-our @EXPORT_OK = qw(
+use GLPI::Agent::Task::NetStat::Version;
+use GLPI::Agent::Tools::NetStat qw(
     getNetConnections
-    getListeningPorts
-    getProcessList
     getProcessMap
-    resolveDNS
-    clear_dns_cache
-    getHttpSysPorts
 );
 
-our %EXPORT_TAGS = (
-    all => \@EXPORT_OK,
-);
+our $VERSION = GLPI::Agent::Task::NetStat::Version::VERSION;
 
-my %_dns_cache;
+# ── Task entry points ─────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# getNetConnections( logger => $logger )
-#
-# Returns list of hashrefs:
-#   protocol, local_addr, local_port, remote_addr, remote_port,
-#   state, pid, created_at, offload_state, applied_setting
-# ---------------------------------------------------------------------------
-sub getNetConnections {
-    my (%params) = @_;
-    my $logger = $params{logger};
+sub isEnabled {
+    my ($self, $contact) = @_;
 
-    my @connections;
-
-    if ($OSNAME eq 'MSWin32') {
-        @connections = _getConnectionsWindows_PS(%params);
-        if (!@connections) {
-            $logger->info("NetStat: PowerShell collection failed, falling back to netstat -ano")
-                if $logger;
-            @connections = _getConnectionsWindows_Netstat(%params);
-        }
-    } else {
-        @connections = _getConnectionsLinux(%params);
-    }
-
-    $logger->debug2("NetStat: collected " . scalar(@connections) . " connections")
-        if $logger;
-
-    return @connections;
-}
-
-# ---------------------------------------------------------------------------
-# Windows — PowerShell Get-NetTCPConnection + Get-NetUDPEndpoint
-# ---------------------------------------------------------------------------
-sub _getConnectionsWindows_PS {
-    my (%params) = @_;
-    my $logger = $params{logger};
-
-    my @connections;
-
-    # ── HTTP.SYS detection ─────────────────────────────────────────────
-    # Ports managed by http.sys show PID 4 (System) in netstat/PowerShell.
-    # We remap those to synthetic PID 5 / process "HTTP.SYS" (like SquaredUp).
-    my %httpsys_ports = map { $_ => 1 } getHttpSysPorts(logger => $logger);
-    my $httpsys_count = scalar keys %httpsys_ports;
-    $logger->debug2("NetStat: detected $httpsys_count HTTP.SYS-managed ports")
-        if $logger && $httpsys_count;
-
-    # ── TCP connections ────────────────────────────────────────────────
-    my $ps_tcp = q{powershell -NoProfile -NonInteractive -Command }
-        . q{"Get-NetTCPConnection }
-        . q{| Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,}
-        . q{State,OwningProcess,CreationTime,OffloadState,AppliedSetting }
-        . q{| ConvertTo-Csv -NoTypeInformation"};
-
-    my @tcp_lines = getAllLines(command => $ps_tcp, logger => $logger);
-
-    my @tcp_headers;
-    for my $line (@tcp_lines) {
-        $line =~ s/\r|\n//g;
-        next unless $line =~ /\S/;
-
-        # Strip surrounding quotes from CSV
-        $line =~ s/^"//; $line =~ s/"$//;
-
-        if (!@tcp_headers) {
-            @tcp_headers = split /","/, $line;
-            next;
-        }
-
-        my @fields = split /","/, $line;
-        my %rec;
-        @rec{@tcp_headers} = @fields;
-
-        my $pid   = int($rec{OwningProcess} // 0);
-        my $lport = int($rec{LocalPort}     // 0);
-
-        # HTTP.SYS remap: if PID is 4 (System) and port is HTTP.SYS-managed
-        if ($pid == 4 && $httpsys_ports{$lport}) {
-            $pid = 5;  # synthetic PID — never collides (real PIDs are multiples of 4)
-        }
-
-        push @connections, {
-            protocol        => 'TCP',
-            local_addr      => $rec{LocalAddress}    // '',
-            local_port      => $lport,
-            remote_addr     => $rec{RemoteAddress}   // '',
-            remote_port     => int($rec{RemotePort}  // 0),
-            state           => $rec{State}           // '',
-            pid             => $pid,
-            created_at      => $rec{CreationTime}    // '',
-            offload_state   => $rec{OffloadState}    // '',
-            applied_setting => $rec{AppliedSetting}  // '',
-        };
-    }
-
-    # ── UDP endpoints ──────────────────────────────────────────────────
-    my $ps_udp = q{powershell -NoProfile -NonInteractive -Command }
-        . q{"Get-NetUDPEndpoint }
-        . q{| Select-Object LocalAddress,LocalPort,OwningProcess,CreationTime }
-        . q{| ConvertTo-Csv -NoTypeInformation"};
-
-    my @udp_lines = getAllLines(command => $ps_udp, logger => $logger);
-
-    my @udp_headers;
-    for my $line (@udp_lines) {
-        $line =~ s/\r|\n//g;
-        next unless $line =~ /\S/;
-
-        $line =~ s/^"//; $line =~ s/"$//;
-
-        if (!@udp_headers) {
-            @udp_headers = split /","/, $line;
-            next;
-        }
-
-        my @fields = split /","/, $line;
-        my %rec;
-        @rec{@udp_headers} = @fields;
-
-        push @connections, {
-            protocol        => 'UDP',
-            local_addr      => $rec{LocalAddress}   // '',
-            local_port      => int($rec{LocalPort}  // 0),
-            remote_addr     => '*',
-            remote_port     => 0,
-            state           => 'STATELESS',
-            pid             => int($rec{OwningProcess} // 0),
-            created_at      => $rec{CreationTime}   // '',
-            offload_state   => '',
-            applied_setting => '',
-        };
-    }
-
-    return @connections;
-}
-
-# ---------------------------------------------------------------------------
-# Windows fallback — netstat -ano (Server 2008 R2 / PS < 4)
-# ---------------------------------------------------------------------------
-sub _getConnectionsWindows_Netstat {
-    my (%params) = @_;
-    my $logger = $params{logger};
-    my @connections;
-
-    my @lines = getAllLines(command => 'netstat -ano', logger => $logger);
-
-    for my $line (@lines) {
-        next unless $line =~ /^\s*(TCP|UDP)\s+(\S+)\s+(\S+)\s*(\S*)\s+(\d+)\s*$/i;
-
-        my ($proto, $local, $remote, $state, $pid) = ($1, $2, $3, $4, $5);
-        my ($la, $lp) = _splitAddrPort($local);
-        my ($ra, $rp) = _splitAddrPort($remote);
-
-        push @connections, {
-            protocol        => uc($proto),
-            local_addr      => $la,
-            local_port      => $lp,
-            remote_addr     => $ra,
-            remote_port     => $rp,
-            state           => $state || 'STATELESS',
-            pid             => int($pid),
-            created_at      => '',     # not available via netstat
-            offload_state   => '',
-            applied_setting => '',
-        };
-    }
-
-    return @connections;
-}
-
-# ---------------------------------------------------------------------------
-# Linux — ss -tunap, fallback netstat -tunap
-# ---------------------------------------------------------------------------
-sub _getConnectionsLinux {
-    my (%params) = @_;
-    my $logger = $params{logger};
-    my @connections;
-
-    my $use_ss  = canRun('ss');
-    my $command  = $use_ss ? 'ss -tunap --no-header' : 'netstat -tunap --numeric';
-    my @lines    = getAllLines(command => $command, logger => $logger);
-
-    for my $line (@lines) {
-        if ($use_ss) {
-            # ss output: State Recv-Q Send-Q Local:Port  Peer:Port  Process
-            next unless $line =~ /^(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s*(.*)/;
-            my ($state, $local, $remote, $rest) = ($1, $2, $3, $4);
-            my ($la, $lp) = _splitAddrPort($local);
-            my ($ra, $rp) = _splitAddrPort($remote);
-
-            my $pid = 0;
-            if ($rest =~ /pid=(\d+)/) {
-                $pid = int($1);
-            }
-
-            # ss states: ESTAB, LISTEN, TIME-WAIT, etc.
-            my $proto = ($line =~ /^udp/i) ? 'UDP' : 'TCP';
-
-            push @connections, {
-                protocol        => $proto,
-                local_addr      => $la,
-                local_port      => $lp,
-                remote_addr     => $ra,
-                remote_port     => $rp,
-                state           => uc($state),
-                pid             => $pid,
-                created_at      => '',
-                offload_state   => '',
-                applied_setting => '',
-            };
-        } else {
-            # netstat: Proto Recv-Q Send-Q Local Foreign State PID/Program
-            next unless $line =~ /^(tcp6?|udp6?)\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s+(\S*)\s*(\S*)/i;
-            my ($proto, $local, $remote, $state, $pidprog) = ($1, $2, $3, $4, $5);
-            my ($la, $lp) = _splitAddrPort($local);
-            my ($ra, $rp) = _splitAddrPort($remote);
-
-            my $pid = 0;
-            $pid = int($1) if ($pidprog // '') =~ /^(\d+)/;
-
-            push @connections, {
-                protocol        => ($proto =~ /udp/i) ? 'UDP' : 'TCP',
-                local_addr      => $la,
-                local_port      => $lp,
-                remote_addr     => $ra,
-                remote_port     => $rp,
-                state           => uc($state || 'STATELESS'),
-                pid             => $pid,
-                created_at      => '',
-                offload_state   => '',
-                applied_setting => '',
-            };
-        }
-    }
-
-    return @connections;
-}
-
-# ---------------------------------------------------------------------------
-# getHttpSysPorts( logger => $logger )
-#
-# Returns list of port numbers managed by HTTP.SYS (IIS, ADFS, WinRM, etc.)
-# Uses: netsh http show servicestate view=requestq
-# ---------------------------------------------------------------------------
-sub getHttpSysPorts {
-    my (%params) = @_;
-    my $logger = $params{logger};
-    my %ports;
-
-    return () unless $OSNAME eq 'MSWin32';
-
-    my @lines = eval { getAllLines(
-        command => 'netsh http show servicestate view=requestq',
-        logger  => $logger,
-    ) };
-
-    if ($@ || !@lines) {
-        $logger->debug2("NetStat: netsh http query failed: $@") if $logger;
-        return ();
-    }
-
-    for my $line (@lines) {
-        # Lines like:   HTTP://+:80/  or  HTTPS://HOSTNAME:443/path
-        if ($line =~ m{https?://[^:]*:(\d+)}i) {
-            $ports{int($1)} = 1;
-        }
-        # Also catch "Registered URL: ..." format
-        if ($line =~ m{URL:\s*https?://[^:]*:(\d+)}i) {
-            $ports{int($1)} = 1;
-        }
-    }
-
-    return keys %ports;
-}
-
-# ---------------------------------------------------------------------------
-# getListeningPorts( logger => $logger )
-# ---------------------------------------------------------------------------
-sub getListeningPorts {
-    my (%params) = @_;
-    my @all = getNetConnections(%params);
-    return grep {
-           ($_->{state} // '') eq 'Listen'
-        || ($_->{state} // '') eq 'LISTENING'
-        || ($_->{state} // '') eq 'LISTEN'
-        || ($_->{protocol} // '') eq 'UDP'
-    } @all;
-}
-
-# ---------------------------------------------------------------------------
-# getProcessList( logger => $logger )
-# Returns list of hashrefs: pid, name, description, cmd, user, session_id, mem_kb
-# ---------------------------------------------------------------------------
-sub getProcessList {
-    my (%params) = @_;
-    my $logger = $params{logger};
-    my @processes;
-
-    if ($OSNAME eq 'MSWin32') {
-        @processes = _getProcessListWindows(%params);
-    } else {
-        @processes = _getProcessListLinux(%params);
-    }
-
-    # Inject synthetic HTTP.SYS process (PID 5)
-    push @processes, {
-        pid         => 5,
-        name        => 'HTTP.SYS',
-        description => 'Windows HTTP Service (kernel-mode)',
-        cmd         => 'http.sys',
-        user        => 'SYSTEM',
-        session_id  => 0,
-        mem_kb      => 0,
-    };
-
-    $logger->debug2("NetStat: collected " . scalar(@processes) . " processes")
-        if $logger;
-
-    return @processes;
-}
-
-sub _getProcessListWindows {
-    my (%params) = @_;
-    my $logger = $params{logger};
-    my @processes;
-
-    # Try WMIC first (available on Server 2012-2022, Win10)
-    if (canRun('wmic')) {
-        $logger->debug("CMD: wmic process get ProcessId,Name,Description,CommandLine,SessionId,WorkingSetSize /format:csv")
-            if $logger;
-
-        my @lines = getAllLines(
-            command => 'wmic process get ProcessId,Name,Description,CommandLine,SessionId,WorkingSetSize /format:csv',
-            logger  => $logger,
+    my $cfg = $self->_readConfig();
+    unless ($cfg && $cfg->{push_url} && $cfg->{push_token}) {
+        $self->{logger}->debug(
+            'NetStat: disabled — missing push_url / push_token in conf.d/netstat.cfg'
         );
-
-        # WMIC alphabetizes columns → actual header:
-        #   Node,CommandLine,Description,Name,ProcessId,SessionId,WorkingSetSize
-        #
-        # CommandLine often contains commas (Chrome, Edge, Teams, Electron):
-        #   --field-trial-handle=2040,262144,524288
-        #
-        # FIX: Pop clean numeric fields from the right, shift Node from left,
-        #      reassemble CommandLine from whatever remains in the middle.
-
-        my $header_seen = 0;
-        for my $line (@lines) {
-            $line =~ s/\r|\n//g;
-            next unless $line =~ /\S/;
-
-            # Skip header row
-            if (!$header_seen) {
-                $header_seen = 1;
-                next;
-            }
-
-            # Split on ALL commas (no limit)
-            my @parts = split /,/, $line, -1;
-
-            # Minimum: Node + >=1 CmdLine part + Desc + Name + PID + SID + WSS = 7
-            next unless @parts >= 7;
-
-            # -- Right side (never contain commas) --
-            my $wss_raw        = pop @parts;   # WorkingSetSize
-            my $session_id_raw = pop @parts;   # SessionId
-            my $pid_raw        = pop @parts;   # ProcessId
-            my $name           = pop @parts;   # Name
-            my $description    = pop @parts;   # Description
-
-            # -- Left side --
-            my $node = shift @parts;           # Node (hostname)
-
-            # -- Middle = CommandLine with commas preserved --
-            my $cmd = join(',', @parts);
-
-            # Validate PID
-            next unless defined $pid_raw && $pid_raw =~ /^\d+$/;
-            my $pid = int($pid_raw);
-            next unless $pid > 0;
-
-            # Safe numeric conversions
-            my $mem_kb     = ($wss_raw        // '') =~ /^\d+$/ ? int($wss_raw / 1024) : 0;
-            my $session_id = ($session_id_raw // '') =~ /^\d+$/ ? int($session_id_raw)  : 0;
-
-            push @processes, {
-                pid         => $pid,
-                name        => $name        // 'unknown',
-                description => $description // '',
-                cmd         => $cmd,
-                user        => '',
-                session_id  => $session_id,
-                mem_kb      => $mem_kb,
-                cpu_percent => 0,
-            };
-        }
-
-    } else {
-        # PowerShell fallback (Windows 11 / Server 2025+ where WMIC is removed)
-        # PowerShell ConvertTo-Csv properly quotes fields — no comma issue
-        my $ps_cmd = q{powershell -NoProfile -NonInteractive -Command }
-            . q{"Get-Process | Select-Object Id,ProcessName,Description,Path,SessionId,WorkingSet64 }
-            . q{| ConvertTo-Csv -NoTypeInformation"};
-
-        my @lines = getAllLines(command => $ps_cmd, logger => $logger);
-        my @headers;
-        for my $line (@lines) {
-            $line =~ s/\r|\n//g;
-            next unless $line =~ /\S/;
-
-            # PowerShell CSV is properly quoted: "field1","field2","field3"
-            $line =~ s/^"//; $line =~ s/"$//;
-
-            if (!@headers) {
-                @headers = split /","/, $line;
-                next;
-            }
-
-            my @fields = split /","/, $line;
-            my %rec;
-            @rec{@headers} = @fields;
-
-            my $pid = int($rec{Id} // 0);
-            next unless $pid > 0;
-
-            my $ws = $rec{WorkingSet64} // 0;
-            my $mem_kb = ($ws =~ /^\d+$/) ? int($ws / 1024) : 0;
-
-            push @processes, {
-                pid         => $pid,
-                name        => $rec{ProcessName} // 'unknown',
-                description => $rec{Description} // '',
-                cmd         => $rec{Path}        // '',
-                user        => '',
-                session_id  => int($rec{SessionId} // 0),
-                mem_kb      => $mem_kb,
-                cpu_percent => 0,
-            };
-        }
+        return 0;
     }
 
-    $logger->debug2("NetStat: collected " . scalar(@processes) . " processes")
-        if $logger;
-
-    return @processes;
+    $self->{_cfg} = $cfg;
+    $self->{logger}->debug("NetStat: enabled (push_url=$cfg->{push_url})");
+    return 1;
 }
 
-sub _getProcessListLinux {
-    my (%params) = @_;
-    my $logger = $params{logger};
-    my @processes;
+sub run {
+    my ($self, %params) = @_;
 
-    # ps with wide output
-    my @lines = getAllLines(
-        command => 'ps -eo pid,user,rss,comm,args --no-headers',
-        logger  => $logger,
+    my $logger = $self->{logger};
+    my $cfg    = $self->{_cfg} // $self->_readConfig();
+
+    unless ($cfg && $cfg->{push_url} && $cfg->{push_token}) {
+        $logger->error('NetStat: missing configuration — aborting');
+        return;
+    }
+
+    $logger->info('NetStat: collecting connections');
+
+    # ── Collect ───────────────────────────────────────────────────────────
+    my @raw = eval { getNetConnections(logger => $logger) };
+    if ($@) {
+        $logger->error("NetStat: collection error — $@");
+        return;
+    }
+
+    my %proc_map = eval { getProcessMap(logger => $logger) };
+    $logger->debug("NetStat: raw=" . scalar(@raw) . " connections collected");
+
+    # ── Filter and enrich ─────────────────────────────────────────────────
+    my @connections;
+    for my $c (@raw) {
+        # Skip unconnected / loopback / empty remote
+        my $raddr = $c->{remote_addr} // '';
+        my $rport = int($c->{remote_port} // 0);
+        my $laddr = $c->{local_addr}  // '';
+
+        next if $raddr eq '' || $raddr eq '*' || $raddr eq '0.0.0.0' || $raddr eq '::';
+        next if $rport == 0;
+        next if $laddr =~ /^127\./ || $laddr eq '::1';
+        next if $raddr =~ /^127\./ || $raddr eq '::1';
+
+        # Skip LISTENING entries (remote would be 0.0.0.0 — already filtered above)
+        my $state = uc($c->{state} // '');
+        next if $state eq 'LISTEN' || $state eq 'LISTENING';
+        next if $state eq 'SYN_SENT' || $state eq 'SYN_RECEIVED';
+
+        # Resolve process name from process map
+        my $pid  = int($c->{pid} // 0);
+        my $proc = ($pid > 0 && $proc_map{$pid}) ? $proc_map{$pid}{name} : '';
+
+        # Determine connection direction
+        my $lport = int($c->{local_port} // 0);
+        my $conn_direction = _detectDirection($lport, $rport);
+
+        push @connections, {
+            protocol        => $c->{protocol}        // 'TCP',
+            local_addr      => $laddr,
+            local_port      => $lport,
+            remote_addr     => $raddr,
+            remote_port     => $rport,
+            state           => $state,
+            conn_direction  => $conn_direction,
+            process_name    => $proc,
+            pid             => $pid,
+            created_at      => $c->{created_at}      // '',
+            offload_state   => $c->{offload_state}   // '',
+            applied_setting => $c->{applied_setting} // '',
+        };
+    }
+
+    $logger->info('NetStat: pushing ' . scalar(@connections) . ' connection(s)');
+
+    # ── Push ──────────────────────────────────────────────────────────────
+    $self->_push($cfg, {
+        hostname        => _shortHostname(),
+        collected_at    => _now(),
+        collection_method => 'agent_perl',
+        connections     => \@connections,
+    });
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+sub _detectDirection {
+    my ($lport, $rport) = @_;
+
+    # Remote port is a well-known service, our local is ephemeral → we are the client
+    return 'outbound' if $rport  <  1024 && $lport >= 1024;
+
+    # Our local port is a well-known service, remote is ephemeral → remote is the client
+    return 'inbound'  if $lport  <  1024 && $rport >= 1024;
+
+    # Remote uses an ephemeral port (≥49152) and our local is in service range → inbound
+    return 'inbound'  if $rport >= 49152 && $lport  < 49152;
+
+    # We use an ephemeral port (≥49152) → outbound client
+    return 'outbound' if $lport >= 49152 && $rport  < 49152;
+
+    # Both high ports: lower one is likely the service
+    return ($lport <= $rport) ? 'inbound' : 'outbound';
+}
+
+sub _shortHostname {
+    my $h = eval { Sys::Hostname::hostname() } // '';
+    $h ||= do { my $o = `hostname 2>nul`; $o =~ s/\r?\n//g; $o };
+    $h =~ s/\..*$//;   # strip domain part
+    return $h;
+}
+
+sub _now {
+    my @t = localtime(time);
+    return sprintf '%04d-%02d-%02d %02d:%02d:%02d',
+        $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0];
+}
+
+# ── HTTP push ─────────────────────────────────────────────────────────────────
+
+sub _push {
+    my ($self, $cfg, $payload) = @_;
+
+    my $logger = $self->{logger};
+
+    my $json = eval {
+        require Cpanel::JSON::XS;
+        Cpanel::JSON::XS->new->utf8->canonical->encode($payload);
+    };
+    if ($@) {
+        require JSON::PP;
+        $json = JSON::PP->new->utf8->canonical->encode($payload);
+    }
+
+    my $ua = LWP::UserAgent->new(
+        timeout  => 60,
+        ssl_opts => { verify_hostname => 0 },
     );
 
-    for my $line (@lines) {
-        next unless $line =~ /^\s*(\d+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(.*)/;
-        push @processes, {
-            pid         => int($1),
-            user        => $2,
-            mem_kb      => int($3),
-            name        => $4,
-            description => '',
-            cmd         => $5,
-            session_id  => 0,
-        };
-    }
+    my $req = HTTP::Request->new(POST => $cfg->{push_url});
+    $req->header('Content-Type'    => 'application/json; charset=utf-8');
+    $req->header('X-NetStat-Token' => $cfg->{push_token});
+    $req->content(encode('UTF-8', $json));
 
-    return @processes;
-}
+    $logger->debug("NetStat: POST → $cfg->{push_url}");
 
-# ---------------------------------------------------------------------------
-# getProcessMap( logger => $logger )
-# Returns hashref keyed by PID for O(1) lookup
-# ---------------------------------------------------------------------------
-sub getProcessMap {
-    my (%params) = @_;
-    my $logger = $params{logger};
-    my %proc;
-
-    if ($OSNAME eq 'MSWin32') {
-        my @list = _getProcessListWindows(%params);
-        for my $p (@list) {
-            $proc{$p->{pid}} = {
-                name        => $p->{name},
-                description => $p->{description},
-                cmd         => $p->{cmd},
-                session_id  => $p->{session_id},
-                mem_kb      => $p->{mem_kb},
-            };
-        }
+    my $resp = $ua->request($req);
+    if ($resp->is_success) {
+        $logger->info('NetStat: push OK — ' . $resp->decoded_content);
     } else {
-        # Linux: ps aux
-        my @lines = getAllLines(command => 'ps aux --no-headers', logger => $logger);
-        for my $line (@lines) {
-            my ($user, $pid, undef, undef, undef, $rss, undef, undef, undef, undef, @cmd_parts)
-                = split /\s+/, $line;
-            next unless defined $pid && $pid =~ /^\d+$/;
-            my $cmd_str = join(' ', @cmd_parts);
-            my $name = (split m{/}, $cmd_parts[0] // '')[-1] // 'unknown';
-            $proc{int($pid)} = {
-                name        => $name,
-                description => '',
-                cmd         => $cmd_str,
-                session_id  => 0,
-                mem_kb      => int($rss // 0),
-            };
+        $logger->error('NetStat: push FAILED ' . $resp->status_line
+            . ' — ' . $resp->decoded_content);
+    }
+}
+
+# ── Config reader ─────────────────────────────────────────────────────────────
+
+sub _readConfig {
+    my ($self) = @_;
+
+    my @paths = (
+        'C:/Program Files/GLPI-Agent/etc/conf.d/netstat.cfg',
+        'C:/Program Files (x86)/GLPI-Agent/etc/conf.d/netstat.cfg',
+        '/etc/glpi-agent/conf.d/netstat.cfg',
+        '/usr/local/etc/glpi-agent/conf.d/netstat.cfg',
+    );
+
+    for my $path (@paths) {
+        next unless -f $path;
+        my %cfg;
+        open my $fh, '<', $path or next;
+        while (<$fh>) {
+            s/#.*//;
+            s/^\s+|\s+$//g;
+            next unless /^(\S+)\s*=\s*(.+)$/;
+            $cfg{$1} = $2;
         }
+        close $fh;
+        return \%cfg if $cfg{push_url} && $cfg{push_token};
     }
 
-    $logger->debug("Got " . scalar(keys %proc) . " processes (incl. HTTP.SYS synthetic)")
-        if $logger;
-
-    return %proc;
-}
-
-# ---------------------------------------------------------------------------
-# resolveDNS( $ip )
-# ---------------------------------------------------------------------------
-sub resolveDNS {
-    my ($ip) = @_;
-    return $ip unless defined $ip && $ip =~ /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
-    return $_dns_cache{$ip} if exists $_dns_cache{$ip};
-
-    my $packed = inet_aton($ip);
-    my $hostname;
-    if ($packed) {
-        $hostname = gethostbyaddr($packed, AF_INET);
-    }
-    $_dns_cache{$ip} = $hostname // $ip;
-    return $_dns_cache{$ip};
-}
-
-sub clear_dns_cache { %_dns_cache = () }
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-sub _splitAddrPort {
-    my ($s) = @_;
-    return ('', 0) unless defined $s;
-
-    # IPv6: [::1]:443
-    return ($1, int($2)) if $s =~ /^\[(.+)\]:(\d+)$/;
-
-    # IPv4: 0.0.0.0:443 or *:*
-    if ($s =~ /^(.+):(\d+|\*)$/) {
-        return ($1, $2 eq '*' ? 0 : int($2));
-    }
-
-    return ($s, 0);
+    return undef;
 }
 
 1;
-
-__END__
-
-=head1 EXPORTED FUNCTIONS
-
-=head2 getNetConnections( logger => $logger )
-
-Returns list of connection hashrefs with:
-  protocol, local_addr, local_port, remote_addr, remote_port,
-  state, pid, created_at, offload_state, applied_setting
-
-=head2 getHttpSysPorts( logger => $logger )
-
-Returns list of port numbers managed by HTTP.SYS kernel driver.
-
-=head2 getListeningPorts( logger => $logger )
-
-Filtered subset of getNetConnections: LISTEN + UDP only.
-
-=head2 getProcessList( logger => $logger )
-
-Returns list of process hashrefs:
-  pid, name, description, cmd, user, session_id, mem_kb
-Includes synthetic HTTP.SYS process (PID 5).
-
-=head2 getProcessMap( logger => $logger )
-
-Hash keyed by PID for O(1) lookup.
-
-=head2 resolveDNS( $ip )
-
-Reverse DNS with per-run memory cache.
-
-=head1 VERSION
-
-2.0.0
-
-=cut

@@ -1,6 +1,6 @@
 <?php
 /**
- * Plugin: netstatconnections v1.3.0
+ * Plugin: netstatconnections v1.3.2
  * Network Connections — lifecycle push, auto-lock, Impact Analysis
  *
  * v1.3.0 — Pillar 1: Connection lifecycle via bulk push endpoint
@@ -8,9 +8,31 @@
  *   - handleInventory(): $seen_ids init fix, conn_direction in UPDATE/INSERT
  *   - Agent: bulk push mode (single POST replaces delete+insert loop)
  *   - Vanished connections marked 'closed' instead of deleted
+ *
+ * v1.3.1 — GLPI Agent Perl module + token auth
+ *   - New: plugin/agent/GLPI/Agent/Task/NetStat.pm — runs inside GLPI Agent service
+ *          (no "Run as Administrator" needed)
+ *   - New: plugin config table (push_token) displayed on port.php
+ *   - push.php: X-NetStat-Token header auth (Perl module) in addition to Session-Token
+ *
+ * v1.3.2 — Per-port locking + server-side bulk lock (Pillar 4)
+ *   - lock.php: WHERE scoped to (computers_id + remote_addr + service port)
+ *   - lock.php: smart unlock — impact removed only when last locked port to remote
+ *   - bulk_lock.php: new endpoint — lock/unlock ALL inbound clients on a port
+ *   - connection.class.php: inbound group headers + "Lock all inbound" button
+ *
+ * v1.4.0 — Pillar 7: Cron housekeeping
+ *   - cronInfo() — GLPI cron UI now shows task descriptions + param label
+ *   - NetstatResolveAll: two-pass resolve, deduped by IP; pass 2 retries
+ *     rows previously stamped 'unresolved' (DNS / GLPI inventory may have updated)
+ *   - NetstatAutoLock: existing sweep already catches pre-policy connections
+ *   - NetstatCleanup: retention days configurable via cron param field (default 30)
+ *   - hook.php: indexes on last_seen / connection_status / resolved_via for cron perf
+ *   - Impact relation name accumulation fix: _buildImpactName() always reflects
+ *     all currently-locked ports; remove-then-ensure bug eliminated
  */
 
-define('PLUGIN_NETSTATCONNECTIONS_VERSION', '1.3.0');
+define('PLUGIN_NETSTATCONNECTIONS_VERSION', '1.4.0');
 define('PLUGIN_NETSTATCONNECTIONS_MIN_GLPI', '11.0.0');
 define('PLUGIN_NETSTATCONNECTIONS_MAX_GLPI', '12.0.0');
 
@@ -36,6 +58,13 @@ function plugin_init_netstatconnections(): void {
 
     $PLUGIN_HOOKS['csrf_compliant']['netstatconnections'] = true;
 
+    // Allow unauthenticated access to push.php — push.php validates its own token.
+    \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts(
+        'netstatconnections',
+        '#^/front/push\.php#',
+        \Glpi\Http\Firewall::STRATEGY_NO_CHECK
+    );
+
     // Register classes
     Plugin::registerClass('PluginNetstatconnectionsConnection', ['addtabon' => ['Computer']]);
     Plugin::registerClass('PluginNetstatconnectionsPort');
@@ -43,19 +72,17 @@ function plugin_init_netstatconnections(): void {
     // Config page link
     $PLUGIN_HOOKS['config_page']['netstatconnections'] = 'front/port.php';
 
-    // Register under Setup → Dropdowns
-    $PLUGIN_HOOKS['menu_toadd']['netstatconnections'] = ['config' => 'PluginNetstatconnectionsPort'];
-
-    // Setup → Dropdowns
-    $PLUGIN_HOOKS['plugin_dropdown_tabs']['netstatconnections'] = [
-        'PluginNetstatconnectionsPort'
-    ];
+    // Register under Plugins menu
+    $PLUGIN_HOOKS['menu_toadd']['netstatconnections'] = ['plugins' => 'PluginNetstatconnectionsPort'];
 
     // Inventory handler — process netstat data on inventory push
     $PLUGIN_HOOKS['inventory_injection']['netstatconnections'] = [
         'PluginNetstatconnectionsInventoryhandler',
         'handleInventory'
     ];
+
+    // Cron — lets GLPI's cron runner find the plugin's task class
+    $PLUGIN_HOOKS['cron']['netstatconnections'] = 'PluginNetstatconnectionsCrontask';
 }
 
 function plugin_version_netstatconnections(): array {

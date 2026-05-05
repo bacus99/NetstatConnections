@@ -7,6 +7,31 @@
 function plugin_netstatconnections_install(): bool {
     global $DB;
 
+    // ── plugin config table ───────────────────────────────────────────
+    if (!$DB->tableExists('glpi_plugin_netstatconnections_config')) {
+        $DB->doQuery("CREATE TABLE `glpi_plugin_netstatconnections_config` (
+            `key`   VARCHAR(100) NOT NULL,
+            `value` TEXT         DEFAULT NULL,
+            PRIMARY KEY (`key`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
+    }
+
+    // Generate push_token if not set
+    $existing = $DB->request([
+        'SELECT' => ['value'],
+        'FROM'   => 'glpi_plugin_netstatconnections_config',
+        'WHERE'  => ['key' => 'push_token'],
+        'LIMIT'  => 1,
+    ])->current();
+
+    if (!$existing || empty($existing['value'])) {
+        $token = bin2hex(random_bytes(32)); // 64-char hex token
+        $DB->insert('glpi_plugin_netstatconnections_config', [
+            'key'   => 'push_token',
+            'value' => $token,
+        ]);
+    }
+
     // ── connections table ──────────────────────────────────────────────
     if (!$DB->tableExists('glpi_plugin_netstatconnections_connections')) {
         $DB->doQuery("CREATE TABLE `glpi_plugin_netstatconnections_connections` (
@@ -159,10 +184,6 @@ function plugin_netstatconnections_install(): bool {
         ], ['port_number' => $db_ports]);
     }
 
-    // ── Cron tasks ────────────────────────────────────────────────────
-    PluginNetstatconnectionsCrontask::registerCronTasks();
-
-
     // v1.2.0 lifecycle migration
     $table = 'glpi_plugin_netstatconnections_connections';
     if ($DB->tableExists($table)) {
@@ -174,10 +195,18 @@ function plugin_netstatconnections_install(): bool {
         }
         // Backfill
         $DB->doQuery("UPDATE `{$table}` SET `last_seen` = `collected_at`, `connection_status` = 'active' WHERE `last_seen` IS NULL");
-        // Indexes (safe to re-run, MySQL ignores if exists)
+
+        // Indexes for cron performance (MySQL silently ignores IF EXISTS equivalent via try/catch)
+        foreach ([
+            "ALTER TABLE `{$table}` ADD INDEX `last_seen`         (`last_seen`)",
+            "ALTER TABLE `{$table}` ADD INDEX `connection_status` (`connection_status`)",
+            "ALTER TABLE `{$table}` ADD INDEX `resolved_via`      (`resolved_via`(20))",
+        ] as $idx_sql) {
+            try { $DB->doQuery($idx_sql); } catch (\Throwable $e) { /* already exists */ }
+        }
     }
 
-    // Register cleanup cron
+    // ── Cron tasks (registered once) ─────────────────────────────────
     PluginNetstatconnectionsCrontask::registerCronTasks();
 
     return true;
@@ -189,6 +218,7 @@ function plugin_netstatconnections_uninstall(): bool {
     foreach ([
         'glpi_plugin_netstatconnections_connections',
         'glpi_plugin_netstatconnections_ports',
+        'glpi_plugin_netstatconnections_config',
     ] as $table) {
         if ($DB->tableExists($table)) {
             $DB->doQuery("DROP TABLE `{$table}`");

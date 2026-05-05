@@ -1,10 +1,26 @@
 <?php
 /**
  * PluginNetstatconnectionsCrontask
- * Registers and handles cron tasks:
- *   - NetstatResolveAll: resolve unresolved IPs to GLPI CIs
- *   - NetstatAutoLock:   auto-lock connections matching port policies
- *   - NetstatCleanup:    purge closed connections older than retention period
+ *
+ * Pillar 7 — Cron housekeeping
+ *
+ * Three scheduled tasks:
+ *
+ *   NetstatCleanup    (daily)  — Purge closed unlocked connections older than
+ *                                X days (configurable via cron param field).
+ *                                Set param = 0 to keep forever.
+ *
+ *   NetstatResolveAll (hourly) — Re-resolve IPs to GLPI CIs.
+ *                                Pass 1: rows never attempted (remote_scope null/empty).
+ *                                Pass 2: rows previously marked 'unresolved' — DNS or
+ *                                        GLPI inventory may have added the host since.
+ *                                Deduplicates by remote_addr (resolves each IP once,
+ *                                updates all rows sharing that IP in one shot).
+ *
+ *   NetstatAutoLock   (hourly) — Re-run auto-lock sweep on all unlocked active
+ *                                connections. Catches connections added before a port
+ *                                policy existed — when a new policy is created, the
+ *                                next cron run locks all matching pre-existing rows.
  */
 class PluginNetstatconnectionsCrontask {
 
@@ -123,18 +139,28 @@ class PluginNetstatconnectionsCrontask {
     }
 
     /**
-     * Provide task descriptions for GLPI cron UI.
+     * GLPI cron UI metadata — called by CronTask when rendering the task list.
+     * Must return ['description' => '...'] and optionally ['parameter' => '...']
+     * for tasks that use the param field.
      */
-    public static function getTaskDescription(string $name): string {
+    public static function cronInfo(string $name): array {
         switch ($name) {
             case 'NetstatResolveAll':
-                return 'Resolve unresolved remote IPs to GLPI computers/clusters';
+                return [
+                    'description' => __('Re-resolve remote IPs to GLPI CIs (retries previously unresolved internal IPs)', 'netstatconnections'),
+                ];
+
             case 'NetstatAutoLock':
-                return 'Auto-lock connections matching port definition policies';
+                return [
+                    'description' => __('Auto-lock connections matching port policies (catches pre-policy connections)', 'netstatconnections'),
+                ];
+
             case 'NetstatCleanup':
-                return 'Purge closed network connections older than retention period (param = days)';
-            default:
-                return '';
+                return [
+                    'description' => __('Purge closed unlocked connections older than retention period', 'netstatconnections'),
+                    'parameter'   => __('Retention in days (0 = keep forever)', 'netstatconnections'),
+                ];
         }
+        return [];
     }
 }
