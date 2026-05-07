@@ -39,18 +39,18 @@ if (file_exists($glpi_root . '/vendor/autoload.php')) {
 require_once __DIR__ . '/../inc/agentconfig.class.php';
 require_once __DIR__ . '/../inc/connection.class.php';
 
-// 3. Initialize $DB if missing
+// 3. Initialize $DB via GLPI's official DBConnection (connects on construct)
 global $DB;
-if (!isset($DB) || !$DB) {
+if (!isset($DB) || !$DB || !$DB->tableExists('glpi_computers')) {
     if (file_exists('/etc/glpi/config_db.php')) {
         require_once '/etc/glpi/config_db.php';
     } elseif (file_exists($glpi_root . '/config/config_db.php')) {
         require_once $glpi_root . '/config/config_db.php';
     }
-    if (class_exists('DB')) {
+    if (class_exists('DBConnection') && method_exists('DBConnection', 'establishDBConnection')) {
+        \DBConnection::establishDBConnection(true, false);
+    } elseif (class_exists('DB')) {
         $DB = new \DB();
-    } elseif (class_exists('DBmysql')) {
-        $DB = new \DBmysql();
     }
 }
 
