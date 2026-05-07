@@ -28,19 +28,11 @@
  *
  * No GLPI session required — STRATEGY_NO_CHECK bypass registered in setup.php.
  */
-// Explicitly load Composer autoloader (provides GLPI core class autoloading)
-$glpi_root = realpath(__DIR__ . '/../../..');
-if (file_exists($glpi_root . '/vendor/autoload.php')) {
-    require_once $glpi_root . '/vendor/autoload.php';
-}
-
-include($glpi_root . '/inc/includes.php');
-
-// Plugin::load() requires GLPI_PLUGINS_DIRECTORIES which isn't defined in
-// stateless bootstrap. Composer autoloader handles core classes (CommonDBTM
-// etc.); just require our plugin classes directly.
-require_once __DIR__ . '/../inc/agentconfig.class.php';
-require_once __DIR__ . '/../inc/connection.class.php';
+// GLPI 11 routes ALL requests through public/index.php which bootstraps
+// $DB, autoloaders, and plugin classes BEFORE our script runs. Do NOT
+// include inc/includes.php — that's a backward-compat stub that interferes.
+// Our plugin classes (PluginNetstatconnectionsAgentconfig etc) are
+// autoloaded on first use via the autoloader registered in setup.php.
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');

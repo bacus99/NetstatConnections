@@ -9,13 +9,9 @@
  * No GLPI session required — STRATEGY_NO_CHECK bypass registered in setup.php.
  * The config data is not sensitive (just filter settings).
  */
-$glpi_root = realpath(__DIR__ . '/../../..');
-if (file_exists($glpi_root . '/vendor/autoload.php')) {
-    require_once $glpi_root . '/vendor/autoload.php';
-}
-include($glpi_root . '/inc/includes.php');
-
-require_once __DIR__ . '/../inc/agentconfig.class.php';
+// GLPI 11 has already bootstrapped $DB, autoloaders, and our plugin classes
+// before this script runs (via public/index.php → LegacyFileLoadController).
+// Do NOT include inc/includes.php — it would break the existing bootstrap.
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-cache, no-store, must-revalidate');
