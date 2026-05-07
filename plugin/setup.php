@@ -57,9 +57,16 @@ function plugin_init_netstatconnections(): void {
     ];
 
     // PRE_INVENTORY hook — plain function wrapper defined in hook.php
-    // Avoids class autoloading issues; hook.php is always included by doHook()
     $PLUGIN_HOOKS['pre_inventory']['netstatconnections']
         = 'plugin_netstatconnections_pre_inventory';
+
+    // DIAGNOSTIC: register for SEVERAL inventory-flow hooks to see which fire
+    $PLUGIN_HOOKS['post_inventory']['netstatconnections']
+        = 'plugin_netstatconnections_diag_post_inventory';
+    $PLUGIN_HOOKS['inventory_get_params']['netstatconnections']
+        = 'plugin_netstatconnections_diag_get_params';
+    $PLUGIN_HOOKS['handle_inventory_task']['netstatconnections']
+        = 'plugin_netstatconnections_diag_handle_inv';
 
     // DIAGNOSTIC: log hook registration state
     error_log('[netstatconnections] AFTER registration: '
