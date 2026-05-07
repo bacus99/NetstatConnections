@@ -36,8 +36,13 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 // ── Locate config_db.php and parse credentials ───────────────────────────
+// Try GLPI 11 path (/etc/glpi11) first, then GLPI 10 (/etc/glpi), then in-tree.
 $config_path = null;
-foreach (['/etc/glpi/config_db.php', __DIR__ . '/../../../config/config_db.php'] as $p) {
+foreach ([
+    '/etc/glpi11/config_db.php',
+    '/etc/glpi/config_db.php',
+    __DIR__ . '/../../../config/config_db.php',
+] as $p) {
     if (file_exists($p)) { $config_path = $p; break; }
 }
 if (!$config_path) {
