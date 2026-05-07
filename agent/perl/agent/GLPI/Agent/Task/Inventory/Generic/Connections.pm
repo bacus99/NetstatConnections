@@ -59,8 +59,16 @@ sub doInventory {
     $logger->debug("Connections module: cache schema=$data->{schema_version} method=$method")
         if $logger;
 
-    # ── Inject connections ────────────────────────────────────────────
+    # ── Inject into inventory content directly ────────────────────────
+    # addEntry() rejects unknown section names ("No field support").
+    # Bypass the schema check by writing to the content hash directly.
+    # The PRE_INVENTORY hook on the server extracts these sections
+    # before GLPI schema validation, so they never cause rejection.
+    my $content = $inventory->getContent();
+
+    # ── Connections ───────────────────────────────────────────────────
     my $conn_count = 0;
+    $content->{NETWORK_CONNECTIONS} //= [];
     for my $c (@{$data->{connections} // []}) {
         my $entry = {
             PROTOCOL          => $c->{protocol}        // '',
@@ -80,22 +88,13 @@ sub doInventory {
             SERVICE_PORT      => $c->{service_port}     // $c->{remote_port} // 0,
         };
         _clean($entry);
-
-        eval {
-            $inventory->addEntry(
-                section => 'NETWORK_CONNECTIONS',
-                entry   => $entry,
-            );
-        };
-        if ($@) {
-            $logger->debug("Connections module: addEntry skipped: $@") if $logger;
-            last;
-        }
+        push @{$content->{NETWORK_CONNECTIONS}}, $entry;
         $conn_count++;
     }
 
-    # ── Inject listening ports ────────────────────────────────────────
+    # ── Listening ports ──────────────────────────────────────────────
     my $port_count = 0;
+    $content->{LISTENING_PORTS} //= [];
     for my $p (@{$data->{listening} // []}) {
         my $entry = {
             PROTOCOL     => $p->{protocol}     // '',
@@ -106,21 +105,11 @@ sub doInventory {
             CREATED_AT   => $p->{created_at}   // '',
         };
         _clean($entry);
-
-        eval {
-            $inventory->addEntry(
-                section => 'LISTENING_PORTS',
-                entry   => $entry,
-            );
-        };
-        if ($@) {
-            $logger->debug("Connections module: LISTENING_PORTS skipped: $@") if $logger;
-            last;
-        }
+        push @{$content->{LISTENING_PORTS}}, $entry;
         $port_count++;
     }
 
-    $logger->info("Connections module: sent $conn_count connections, $port_count listening ports [$method]")
+    $logger->info("Connections module: injected $conn_count connections, $port_count listening ports [$method]")
         if $logger;
 }
 
