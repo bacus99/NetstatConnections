@@ -143,7 +143,7 @@ sub _push {
     }
 
     my $server_cfg = eval { decode_json($cfg_resp->decoded_content) };
-    if ($@ || !ref($server_cfg) eq 'HASH') {
+    if ($@ || ref($server_cfg) ne 'HASH') {
         $logger->error("Connections module: invalid JSON from agentconfig.php: $@") if $logger;
         return 0;
     }
