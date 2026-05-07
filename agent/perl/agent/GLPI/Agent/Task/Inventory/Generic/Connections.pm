@@ -61,10 +61,13 @@ sub doInventory {
 
     # ── Inject into inventory content directly ────────────────────────
     # addEntry() rejects unknown section names ("No field support").
-    # Bypass the schema check by writing to the content hash directly.
+    # getContent() returns a NEW Protocol::Inventory wrapper each call
+    # (in JSON mode), so modifications to it are discarded before send.
+    # Write to the raw internal hash ($inventory->{content}) instead —
+    # this is the hash that getContent() copies from during serialization.
     # The PRE_INVENTORY hook on the server extracts these sections
     # before GLPI schema validation, so they never cause rejection.
-    my $content = $inventory->getContent();
+    my $content = $inventory->{content};
 
     # ── Connections ───────────────────────────────────────────────────
     my $conn_count = 0;
