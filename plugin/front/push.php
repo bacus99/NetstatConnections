@@ -30,10 +30,11 @@
  */
 include(__DIR__ . '/../../../inc/includes.php');
 
-// STRATEGY_NO_CHECK skips plugin bootstrap, so the autoloader from setup.php
-// isn't registered. Require our classes directly.
-require_once __DIR__ . '/../inc/agentconfig.class.php';
-require_once __DIR__ . '/../inc/connection.class.php';
+// STRATEGY_NO_CHECK skips plugin bootstrap. Force-load our plugin so its
+// autoloader (registered in setup.php) becomes available. Connection class
+// extends CommonDBTM and depends on GLPI core being fully loaded — using
+// Plugin::load() ensures both core classes and our autoloader are ready.
+Plugin::load('netstatconnections', true);
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');

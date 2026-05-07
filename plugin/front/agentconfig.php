@@ -11,8 +11,9 @@
  */
 include(__DIR__ . '/../../../inc/includes.php');
 
-// STRATEGY_NO_CHECK skips plugin bootstrap; require our classes directly.
-require_once __DIR__ . '/../inc/agentconfig.class.php';
+// STRATEGY_NO_CHECK skips plugin bootstrap; force-load our plugin so its
+// autoloader becomes available.
+Plugin::load('netstatconnections', true);
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-cache, no-store, must-revalidate');
