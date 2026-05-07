@@ -107,20 +107,15 @@ sub _loadCache {
 sub _push {
     my ($config, $logger, $data, $method) = @_;
 
-    # Resolve GLPI server URL from agent config
-    my $glpi_url = '';
-    if ($config && $config->{server}) {
-        my $server = $config->{server};
-        if (ref($server) eq 'ARRAY' && @$server) {
-            $glpi_url = $server->[0];
-        } elsif (!ref($server)) {
-            $glpi_url = $server;
-        }
-    }
+    # Resolve GLPI server URL — try several places since the inventory module's
+    # $config object is transport-agnostic and doesn't expose `server` directly.
+    my $glpi_url = _findServerUrl($config, $logger);
     unless ($glpi_url) {
-        $logger->debug("Connections module: no GLPI server URL — skipping push") if $logger;
+        $logger->error("Connections module: could not determine GLPI server URL — skipping push")
+            if $logger;
         return 0;
     }
+    $logger->debug("Connections module: using GLPI server URL: $glpi_url") if $logger;
     $glpi_url =~ s{/+$}{};
     # If the URL ends with /front/inventory.php, strip it to get base
     $glpi_url =~ s{/front/inventory\.php$}{};
@@ -194,6 +189,84 @@ sub _now {
     my @t = localtime;
     return sprintf("%04d-%02d-%02d %02d:%02d:%02d",
         $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+# ── Resolve GLPI server URL ──────────────────────────────────────────
+# Tries (in order):
+#   1. $config->{server} as hashref or arrayref (some agent versions)
+#   2. Method calls on $config object (newer agent versions)
+#   3. Windows registry HKLM\SOFTWARE\GLPI-Agent
+#   4. agent.cfg file in $agent_root/etc/
+#   5. Any conf.d/*.cfg overrides
+sub _findServerUrl {
+    my ($config, $logger) = @_;
+
+    # Try 1: hash access
+    if (ref($config) eq 'HASH' && $config->{server}) {
+        my $s = $config->{server};
+        return ref($s) eq 'ARRAY' ? $s->[0] : $s if $s;
+    }
+    # Try 2: object access
+    if (ref($config) && $config->can('getValues')) {
+        my $v = eval { $config->getValues() };
+        if (ref($v) eq 'HASH' && $v->{server}) {
+            my $s = $v->{server};
+            return ref($s) eq 'ARRAY' ? $s->[0] : $s if $s;
+        }
+    }
+    if (ref($config)) {
+        for my $key (qw(server _server)) {
+            my $s = eval { $config->{$key} };
+            return $s if $s && !ref($s);
+            return $s->[0] if ref($s) eq 'ARRAY' && @$s;
+        }
+    }
+
+    # Try 3: Windows registry
+    if ($^O eq 'MSWin32') {
+        my $url = eval {
+            require Win32::TieRegistry;
+            Win32::TieRegistry->import();
+            my $key = $Win32::TieRegistry::Registry->Open(
+                'LMachine\\SOFTWARE\\GLPI-Agent\\', { Access => 0x20019 }
+            );
+            return undef unless $key;
+            return $key->{'/server'};
+        };
+        if ($url) {
+            $logger->debug("Connections module: server URL from registry: $url") if $logger;
+            return $url;
+        }
+    }
+
+    # Try 4 + 5: config files
+    my $agent_root = $ENV{GLPI_AGENT_ROOT} // $AGENT_ROOT_DEFAULT;
+    my @candidates = (
+        File::Spec->catfile($agent_root, 'etc', 'agent.cfg'),
+    );
+    my $confd = File::Spec->catfile($agent_root, 'etc', 'conf.d');
+    if (-d $confd) {
+        opendir(my $dh, $confd);
+        while (my $f = readdir($dh)) {
+            push @candidates, File::Spec->catfile($confd, $f) if $f =~ /\.cfg$/;
+        }
+        closedir($dh);
+    }
+    for my $cfg (@candidates) {
+        next unless -r $cfg;
+        open(my $fh, '<', $cfg) or next;
+        while (my $line = <$fh>) {
+            next if $line =~ /^\s*#/;
+            if ($line =~ /^\s*server\s*=\s*(\S+)/) {
+                close $fh;
+                $logger->debug("Connections module: server URL from $cfg: $1") if $logger;
+                return $1;
+            }
+        }
+        close $fh;
+    }
+
+    return undef;
 }
 
 1;
