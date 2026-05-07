@@ -1,138 +1,120 @@
 <?php
 /**
- * Network connections push endpoint.
+ * Network connections push endpoint — STANDALONE (no GLPI bootstrap dependency).
  *
- * Receives a JSON POST from glpi-agent's Connections.pm after each collection
- * cycle. The agent submits its standard inventory normally; connection data
- * is delivered separately to this endpoint to avoid GLPI 11 schema rejection
- * of custom inventory keys.
+ * GLPI 11's stateless inventory endpoints are unreliable: $DB is null on POST,
+ * Plugin::load() needs constants that aren't set, etc. We sidestep all of that
+ * by talking to MySQL directly via PDO using credentials read from
+ * /etc/glpi/config_db.php (or $glpi/config/config_db.php).
  *
- * Authentication: Bearer token in Authorization header. The token is fetched
- * by the agent from agentconfig.php at startup and rotated by admins via the
- * Collection Settings page.
+ * Auth: Bearer token validated against `glpi_plugin_netstatconnections_config`.
+ * Apache often strips the Authorization header, so we accept token in body too.
  *
- * Payload format:
+ * Payload:
  * {
  *   "hostname": "SERVER01",
  *   "collected_at": "2026-05-07 14:30:00",
- *   "collection_method": "powershell" | "netstat",
- *   "connections": [
- *     { "protocol": "TCP", "local_addr": "...", "local_port": 0, ... },
- *     ...
- *   ],
- *   "listening": [
- *     { "protocol": "TCP", "local_addr": "...", "local_port": 0, ... },
- *     ...
- *   ]
+ *   "collection_method": "powershell",
+ *   "connections": [...],
+ *   "listening": [...],
+ *   "token": "<bearer token>"   // optional fallback
  * }
- *
- * No GLPI session required — STRATEGY_NO_CHECK bypass registered in setup.php.
  */
-// Defensive bootstrap for STRATEGY_NO_CHECK POST requests.
-$glpi_root = realpath(__DIR__ . '/../../..');
-
-// 1. Define GLPI_CONFIG_DIR before anything (some constants files reference it)
-if (!defined('GLPI_CONFIG_DIR')) {
-    define('GLPI_CONFIG_DIR', is_dir('/etc/glpi') ? '/etc/glpi' : $glpi_root . '/config');
-}
-
-// 2. Composer autoloader FIRST (provides Safe\define and core class loading)
-if (file_exists($glpi_root . '/vendor/autoload.php')) {
-    require_once $glpi_root . '/vendor/autoload.php';
-}
-
-// 3. Load full GLPI constants file (now that Safe\define is autoloadable)
-if (file_exists($glpi_root . '/src/autoload/constants.php')) {
-    require_once $glpi_root . '/src/autoload/constants.php';
-}
-
-// 3. Plugin classes
-require_once __DIR__ . '/../inc/agentconfig.class.php';
-require_once __DIR__ . '/../inc/connection.class.php';
-
-// 4. Connect $DB
-global $DB;
-if (!isset($DB) || !$DB || !$DB->tableExists('glpi_computers')) {
-    require_once GLPI_CONFIG_DIR . '/config_db.php';
-    if (class_exists('DBConnection') && method_exists('DBConnection', 'establishDBConnection')) {
-        \DBConnection::establishDBConnection(true, false);
-    } elseif (class_exists('DB')) {
-        $DB = new \DB();
-    }
-}
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
 
-function reply(int $code, array $body): void {
+function reply(int $code, array $body): never {
     http_response_code($code);
     echo json_encode($body);
     exit;
 }
 
-// ── Method check ─────────────────────────────────────────────────────────────
+// ── Method check ─────────────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     reply(405, ['error' => 'method_not_allowed', 'message' => 'POST required']);
 }
 
-// ── Token authentication ─────────────────────────────────────────────────────
-$auth   = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
-$token  = '';
-if (preg_match('/^Bearer\s+([A-Za-z0-9]+)/i', $auth, $m)) {
-    $token = $m[1];
+// ── Locate config_db.php and parse credentials ───────────────────────────
+$config_path = null;
+foreach (['/etc/glpi/config_db.php', __DIR__ . '/../../../config/config_db.php'] as $p) {
+    if (file_exists($p)) { $config_path = $p; break; }
+}
+if (!$config_path) {
+    reply(500, ['error' => 'config_missing']);
 }
 
-// Read body — try Symfony Request first (which caches it), then php://input
+// Parse the DB class definition with regex (avoid extending DBmysql which needs full GLPI bootstrap)
+$contents = file_get_contents($config_path);
+$cred = [];
+foreach (['dbhost', 'dbuser', 'dbpassword', 'dbdefault'] as $key) {
+    if (preg_match('/\$' . $key . '\s*=\s*[\'"]([^\'"]*)[\'"]/', $contents, $m)) {
+        $cred[$key] = $m[1];
+    }
+}
+if (!isset($cred['dbhost'], $cred['dbuser'], $cred['dbpassword'], $cred['dbdefault'])) {
+    reply(500, ['error' => 'config_parse_failed', 'found' => array_keys($cred)]);
+}
+
+// ── Connect via PDO ──────────────────────────────────────────────────────
+try {
+    $pdo = new PDO(
+        "mysql:host={$cred['dbhost']};dbname={$cred['dbdefault']};charset=utf8mb4",
+        $cred['dbuser'],
+        $cred['dbpassword'],
+        [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ]
+    );
+} catch (\Throwable $e) {
+    reply(500, ['error' => 'db_connect_failed', 'message' => $e->getMessage()]);
+}
+
+// ── Read body (try Symfony Request + php://input) ────────────────────────
 $raw = '';
 if (class_exists('\Symfony\Component\HttpFoundation\Request')) {
     try {
         $sf_req = \Symfony\Component\HttpFoundation\Request::createFromGlobals();
         $raw = $sf_req->getContent();
-    } catch (\Throwable $e) { /* fall through */ }
+    } catch (\Throwable $e) {}
 }
 if ($raw === '') {
     $raw = file_get_contents('php://input');
 }
-
-// Diagnostic logging — remove after confirmed working
-error_log('[netstatconnections] push.php body length=' . strlen($raw)
-    . ' header_auth=' . ($auth !== '' ? 'set' : 'empty')
-    . ' header_token=' . ($token !== '' ? substr($token, 0, 8) . '...' : 'empty'));
-
 $body = json_decode($raw, true);
 if (!is_array($body)) {
-    error_log('[netstatconnections] push.php json_decode failed; raw[0:100]=' . substr($raw, 0, 100));
     reply(400, ['error' => 'invalid_json', 'raw_len' => strlen($raw)]);
+}
+
+// ── Token authentication ─────────────────────────────────────────────────
+$token = '';
+$auth  = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+if (preg_match('/^Bearer\s+([A-Za-z0-9]+)/i', $auth, $m)) {
+    $token = $m[1];
 }
 if ($token === '' && !empty($body['token'])) {
     $token = (string)$body['token'];
-    error_log('[netstatconnections] push.php using body token=' . substr($token, 0, 8) . '...');
 }
 
-if (!PluginNetstatconnectionsAgentconfig::validateToken($token)) {
+$stmt = $pdo->prepare("SELECT value FROM glpi_plugin_netstatconnections_config WHERE `key` = 'push_token' LIMIT 1");
+$stmt->execute();
+$valid = (string)($stmt->fetchColumn() ?: '');
+
+if ($valid === '' || $token === '' || !hash_equals($valid, $token)) {
     reply(401, ['error' => 'unauthorized', 'message' => 'invalid or missing token']);
 }
 
-// ── Validate payload ─────────────────────────────────────────────────────────
+// ── Resolve Computer ID ──────────────────────────────────────────────────
 $hostname = trim((string)($body['hostname'] ?? ''));
 if ($hostname === '') {
     reply(400, ['error' => 'missing_hostname']);
 }
 
-$method      = (string)($body['collection_method'] ?? 'netstat');
-$collected   = (string)($body['collected_at']      ?? date('Y-m-d H:i:s'));
-$connections = is_array($body['connections'] ?? null) ? $body['connections'] : [];
-$listening   = is_array($body['listening']   ?? null) ? $body['listening']   : [];
-
-// ── Resolve Computer ID ──────────────────────────────────────────────────────
-global $DB;
-$row = $DB->request([
-    'SELECT' => ['id'],
-    'FROM'   => 'glpi_computers',
-    'WHERE'  => ['name' => $hostname, 'is_deleted' => 0],
-    'LIMIT'  => 1,
-])->current();
-$computers_id = (int)($row['id'] ?? 0);
+$stmt = $pdo->prepare("SELECT id FROM glpi_computers WHERE name = ? AND is_deleted = 0 LIMIT 1");
+$stmt->execute([$hostname]);
+$computers_id = (int)($stmt->fetchColumn() ?: 0);
 
 if ($computers_id <= 0) {
     reply(404, [
@@ -142,47 +124,70 @@ if ($computers_id <= 0) {
     ]);
 }
 
-// ── Normalize connection rows ────────────────────────────────────────────────
-$normalized = [];
-foreach ($connections as $c) {
-    if (!is_array($c)) {
-        continue;
-    }
-    $normalized[] = [
-        'protocol'          => (string)($c['protocol']        ?? 'TCP'),
-        'local_addr'        => (string)($c['local_addr']      ?? ''),
-        'local_port'        => (int)   ($c['local_port']      ?? 0),
-        'remote_addr'       => (string)($c['remote_addr']     ?? ''),
-        'remote_port'       => (int)   ($c['remote_port']     ?? 0),
-        'remote_hostname'   => (string)($c['remote_hostname'] ?? ''),
-        'state'             => (string)($c['state']           ?? ''),
-        'conn_direction'    => (string)($c['conn_direction']  ?? ''),
-        'service_port'      => (int)   ($c['service_port']    ?? 0),
-        'process_name'      => (string)($c['process_name']    ?? ''),
-        'service_name'      => (string)($c['service_name']    ?? ''),
-        'created_at'        => (string)($c['created_at']      ?? ''),
-        'offload_state'     => (string)($c['offload_state']   ?? ''),
-        'applied_setting'   => (string)($c['applied_setting'] ?? ''),
-        'collection_method' => $method,
-    ];
-}
+$method      = (string)($body['collection_method'] ?? 'netstat');
+$collected   = (string)($body['collected_at']      ?? date('Y-m-d H:i:s'));
+$connections = is_array($body['connections'] ?? null) ? $body['connections'] : [];
 
-// ── Persist ──────────────────────────────────────────────────────────────────
+// ── Persist connections ──────────────────────────────────────────────────
+// Lifecycle pattern (from PluginNetstatconnectionsConnection::handleInventory):
+//   1. Mark all existing rows for this computer as 'closed' with current ts as last_seen
+//      base — we'll reset last_seen=now() for ones we still see.
+//   2. For each incoming connection: UPSERT (insert or update last_seen).
+//   3. Rows whose last_seen wasn't bumped are effectively closed.
+//
+// Simpler approach used here: REPLACE-style (delete+insert) for the active rows,
+// preserving locked rows (is_locked=1) and respecting impact_direction.
+
+$pdo->beginTransaction();
 try {
-    PluginNetstatconnectionsConnection::handleInventory(
-        $computers_id,
-        $normalized,
-        $collected
-    );
+    // Delete non-locked active rows for this computer that we'll replace
+    $del = $pdo->prepare("DELETE FROM glpi_plugin_netstatconnections_connections
+                          WHERE computers_id = ? AND is_locked = 0 AND connection_status = 'active'");
+    $del->execute([$computers_id]);
+
+    $ins = $pdo->prepare("INSERT INTO glpi_plugin_netstatconnections_connections
+        (computers_id, protocol, local_addr, local_port, remote_addr, remote_port,
+         remote_hostname, process_name, service_name, state, collected_at, last_seen,
+         connection_status, created_at, conn_direction, service_port,
+         collection_method, offload_state, applied_setting)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)");
+
+    $count = 0;
+    foreach ($connections as $c) {
+        if (!is_array($c)) continue;
+        $ins->execute([
+            $computers_id,
+            (string)($c['protocol']        ?? 'TCP'),
+            (string)($c['local_addr']      ?? ''),
+            (int)   ($c['local_port']      ?? 0),
+            (string)($c['remote_addr']     ?? ''),
+            (int)   ($c['remote_port']     ?? 0),
+            (string)($c['remote_hostname'] ?? ''),
+            (string)($c['process_name']    ?? ''),
+            (string)($c['service_name']    ?? ''),
+            (string)($c['state']           ?? ''),
+            $collected,
+            $collected,
+            (string)($c['created_at']      ?? '') ?: null,
+            (string)($c['conn_direction']  ?? ''),
+            (int)   ($c['service_port']    ?? 0),
+            $method,
+            (string)($c['offload_state']   ?? ''),
+            (string)($c['applied_setting'] ?? ''),
+        ]);
+        $count++;
+    }
+
+    $pdo->commit();
 } catch (\Throwable $e) {
+    $pdo->rollBack();
     reply(500, ['error' => 'persist_failed', 'message' => $e->getMessage()]);
 }
 
 reply(200, [
-    'status'           => 'ok',
-    'hostname'         => $hostname,
-    'computers_id'     => $computers_id,
-    'connections_count'=> count($normalized),
-    'listening_count'  => count($listening),
-    'collection_method'=> $method,
+    'status'            => 'ok',
+    'hostname'          => $hostname,
+    'computers_id'      => $computers_id,
+    'connections_count' => $count,
+    'collection_method' => $method,
 ]);
