@@ -9,11 +9,17 @@
  * No GLPI session required — STRATEGY_NO_CHECK bypass registered in setup.php.
  * The config data is not sensitive (just filter settings).
  */
-include(__DIR__ . '/../../../inc/includes.php');
+$glpi_root = realpath(__DIR__ . '/../../..');
+if (file_exists($glpi_root . '/vendor/autoload.php')) {
+    require_once $glpi_root . '/vendor/autoload.php';
+}
+include($glpi_root . '/inc/includes.php');
 
-// STRATEGY_NO_CHECK skips plugin bootstrap; force-load our plugin so its
-// autoloader becomes available.
-Plugin::load('netstatconnections', true);
+if (class_exists('Plugin')) {
+    Plugin::load('netstatconnections', true);
+} else {
+    require_once __DIR__ . '/../inc/agentconfig.class.php';
+}
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-cache, no-store, must-revalidate');

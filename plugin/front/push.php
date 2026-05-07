@@ -28,13 +28,23 @@
  *
  * No GLPI session required — STRATEGY_NO_CHECK bypass registered in setup.php.
  */
-include(__DIR__ . '/../../../inc/includes.php');
+// Explicitly load Composer autoloader (provides GLPI core class autoloading)
+$glpi_root = realpath(__DIR__ . '/../../..');
+if (file_exists($glpi_root . '/vendor/autoload.php')) {
+    require_once $glpi_root . '/vendor/autoload.php';
+}
 
-// STRATEGY_NO_CHECK skips plugin bootstrap. Force-load our plugin so its
-// autoloader (registered in setup.php) becomes available. Connection class
-// extends CommonDBTM and depends on GLPI core being fully loaded — using
-// Plugin::load() ensures both core classes and our autoloader are ready.
-Plugin::load('netstatconnections', true);
+include($glpi_root . '/inc/includes.php');
+
+// STRATEGY_NO_CHECK skips plugin bootstrap; force-load our plugin so its
+// autoloader becomes available.
+if (class_exists('Plugin')) {
+    Plugin::load('netstatconnections', true);
+} else {
+    // Fallback: include our class files directly
+    require_once __DIR__ . '/../inc/agentconfig.class.php';
+    require_once __DIR__ . '/../inc/connection.class.php';
+}
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
