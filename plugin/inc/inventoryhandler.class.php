@@ -23,6 +23,9 @@ class PluginNetstatconnectionsInventoryhandler {
      */
     private static function log(string $msg): void {
         $ts = date('Y-m-d H:i:s');
+        // error_log → apache log (always writable)
+        error_log("[netstatconnections] {$msg}");
+        // Also try the dedicated log file
         @file_put_contents(self::LOG_FILE, "[{$ts}] {$msg}\n", FILE_APPEND | LOCK_EX);
     }
 
