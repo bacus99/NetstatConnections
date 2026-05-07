@@ -304,7 +304,8 @@ function plugin_netstatconnections_install(): bool {
  * $data is a stdClass — object mutations persist (PHP passes objects by handle).
  */
 function plugin_netstatconnections_pre_inventory(mixed $data): mixed {
-    Toolbox::logInFile('netstatconnections', "=== preInventory hook fired ===\n");
+    @file_put_contents('/var/log/glpi/netstatconnections.log',
+        '[' . date('Y-m-d H:i:s') . "] hook wrapper called\n", FILE_APPEND | LOCK_EX);
     return PluginNetstatconnectionsInventoryhandler::preInventory($data);
 }
 
