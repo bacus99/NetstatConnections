@@ -31,19 +31,19 @@
 // Defensive bootstrap for STRATEGY_NO_CHECK POST requests.
 $glpi_root = realpath(__DIR__ . '/../../..');
 
-// 1. Define constants GLPI core needs (GLPI_CONFIG_DIR, etc).
-//    Order matters: define BEFORE Composer autoload so DBConnection can find config.
+// 1. Define GLPI_CONFIG_DIR before anything (some constants files reference it)
 if (!defined('GLPI_CONFIG_DIR')) {
     define('GLPI_CONFIG_DIR', is_dir('/etc/glpi') ? '/etc/glpi' : $glpi_root . '/config');
 }
-// Load full constants file (defines GLPI_LOG_DIR, GLPI_VAR_DIR, etc.)
-if (file_exists($glpi_root . '/src/autoload/constants.php')) {
-    require_once $glpi_root . '/src/autoload/constants.php';
-}
 
-// 2. Composer autoloader
+// 2. Composer autoloader FIRST (provides Safe\define and core class loading)
 if (file_exists($glpi_root . '/vendor/autoload.php')) {
     require_once $glpi_root . '/vendor/autoload.php';
+}
+
+// 3. Load full GLPI constants file (now that Safe\define is autoloadable)
+if (file_exists($glpi_root . '/src/autoload/constants.php')) {
+    require_once $glpi_root . '/src/autoload/constants.php';
 }
 
 // 3. Plugin classes
