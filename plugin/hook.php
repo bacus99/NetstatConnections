@@ -76,7 +76,7 @@ function plugin_netstatconnections_install(): bool {
             KEY `collected_at`      (`collected_at`),
             KEY `last_seen`         (`last_seen`),
             KEY `connection_status` (`connection_status`),
-            KEY `resolved_via`      (`resolved_via`(20))
+            KEY `resolved_via`      (`resolved_via`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
     }
 
@@ -140,7 +140,7 @@ function plugin_netstatconnections_install(): bool {
     foreach ([
         "ALTER TABLE `{$table}` ADD INDEX `last_seen`         (`last_seen`)",
         "ALTER TABLE `{$table}` ADD INDEX `connection_status` (`connection_status`)",
-        "ALTER TABLE `{$table}` ADD INDEX `resolved_via`      (`resolved_via`(20))",
+        "ALTER TABLE `{$table}` ADD INDEX `resolved_via`      (`resolved_via`)",
     ] as $idx_sql) {
         try { $DB->doQuery($idx_sql); } catch (\Throwable $e) {}
     }
