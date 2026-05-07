@@ -160,6 +160,12 @@ try {
     $count = 0;
     foreach ($connections as $c) {
         if (!is_array($c)) continue;
+        // Validate created_at to avoid '0000-00-00' warnings
+        $created_at = null;
+        if (!empty($c['created_at']) && preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/', (string)$c['created_at'])
+            && !str_starts_with((string)$c['created_at'], '0000-')) {
+            $created_at = (string)$c['created_at'];
+        }
         $ins->execute([
             $computers_id,
             (string)($c['protocol']        ?? 'TCP'),
@@ -173,7 +179,7 @@ try {
             (string)($c['state']           ?? ''),
             $collected,
             $collected,
-            (string)($c['created_at']      ?? '') ?: null,
+            $created_at,
             (string)($c['conn_direction']  ?? ''),
             (int)   ($c['service_port']    ?? 0),
             $method,
