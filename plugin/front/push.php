@@ -74,14 +74,32 @@ $token  = '';
 if (preg_match('/^Bearer\s+([A-Za-z0-9]+)/i', $auth, $m)) {
     $token = $m[1];
 }
-// Fallback: token in body (less ideal but works through proxies that strip headers)
-$raw    = file_get_contents('php://input');
-$body   = json_decode($raw, true);
+
+// Read body — try Symfony Request first (which caches it), then php://input
+$raw = '';
+if (class_exists('\Symfony\Component\HttpFoundation\Request')) {
+    try {
+        $sf_req = \Symfony\Component\HttpFoundation\Request::createFromGlobals();
+        $raw = $sf_req->getContent();
+    } catch (\Throwable $e) { /* fall through */ }
+}
+if ($raw === '') {
+    $raw = file_get_contents('php://input');
+}
+
+// Diagnostic logging — remove after confirmed working
+error_log('[netstatconnections] push.php body length=' . strlen($raw)
+    . ' header_auth=' . ($auth !== '' ? 'set' : 'empty')
+    . ' header_token=' . ($token !== '' ? substr($token, 0, 8) . '...' : 'empty'));
+
+$body = json_decode($raw, true);
 if (!is_array($body)) {
-    reply(400, ['error' => 'invalid_json']);
+    error_log('[netstatconnections] push.php json_decode failed; raw[0:100]=' . substr($raw, 0, 100));
+    reply(400, ['error' => 'invalid_json', 'raw_len' => strlen($raw)]);
 }
 if ($token === '' && !empty($body['token'])) {
     $token = (string)$body['token'];
+    error_log('[netstatconnections] push.php using body token=' . substr($token, 0, 8) . '...');
 }
 
 if (!PluginNetstatconnectionsAgentconfig::validateToken($token)) {
