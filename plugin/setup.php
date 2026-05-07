@@ -35,6 +35,9 @@ include_once __DIR__ . '/hook.php';
 function plugin_init_netstatconnections(): void {
     global $PLUGIN_HOOKS;
 
+    // DIAGNOSTIC: confirms plugin_init is being called
+    error_log('[netstatconnections] plugin_init called for URI=' . ($_SERVER['REQUEST_URI'] ?? 'cli'));
+
     $PLUGIN_HOOKS['csrf_compliant']['netstatconnections'] = true;
 
     // Register classes
