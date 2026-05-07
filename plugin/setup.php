@@ -68,6 +68,26 @@ function plugin_init_netstatconnections(): void {
     $PLUGIN_HOOKS['handle_inventory_task']['netstatconnections']
         = 'plugin_netstatconnections_diag_handle_inv';
 
+    // FIX: Force-add ourselves to Plugin::$activated_plugins via reflection.
+    // GLPI 11 stateless inventory route runs Plugin::load() (firing this init)
+    // but doesn't fully run Plugin::init(), so $activated_plugins stays empty.
+    // doHook() then skips us with isPluginActive() check returning false.
+    try {
+        $ref = new \ReflectionClass(\Plugin::class);
+        if ($ref->hasProperty('activated_plugins')) {
+            $prop = $ref->getProperty('activated_plugins');
+            $prop->setAccessible(true);
+            $current = $prop->getValue();
+            if (is_array($current) && !in_array('netstatconnections', $current, true)) {
+                $current[] = 'netstatconnections';
+                $prop->setValue(null, $current);
+                error_log('[netstatconnections] FIX: force-added to Plugin::$activated_plugins');
+            }
+        }
+    } catch (\Throwable $e) {
+        error_log('[netstatconnections] FIX failed: ' . $e->getMessage());
+    }
+
     // DIAGNOSTIC: log hook registration state
     error_log('[netstatconnections] AFTER registration: '
         . 'function_exists=' . (function_exists('plugin_netstatconnections_pre_inventory') ? 'Y' : 'N')
