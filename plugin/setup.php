@@ -1,17 +1,20 @@
 <?php
 /**
- * Plugin: netstatconnections v2.0.0
+ * Plugin: netstatconnections v2.1.0
  * Network Connections — GLPI native inventory enhancement
  *
- * v2.0.0 — Native inventory integration
- *   - Server-pushed agent config: agents fetch collection filters from GLPI UI
- *   - PRE_INVENTORY hook replaces custom push endpoint + token auth
- *   - Agent Connections.pm uses standard addEntry() — no custom credentials
- *   - Relation Types with semantic edge coloring in dependency map
- *   - Fixed computers_id / remote_items_id column types to INT UNSIGNED
+ * v2.1.0 — Push endpoint architecture (reverted from PRE_INVENTORY hook)
+ *   - GLPI 11.0.6 stateless inventory route loads plugins AFTER doHook(PRE_INVENTORY)
+ *     fires, so the hook is unreachable. We use a separate /front/push.php
+ *     endpoint instead (same approach as v1.x) — agent submits standard
+ *     inventory normally, then POSTs connections separately.
+ *   - Token-based auth: agent fetches token from agentconfig.php, includes
+ *     it as Bearer in push.php POSTs.
+ *   - Server-pushed agent config remains: filters configured in GLPI UI
+ *     are auto-fetched by agents.
  */
 
-define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.0.0');
+define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.1.0');
 define('PLUGIN_NETSTATCONNECTIONS_MIN_GLPI', '11.0.0');
 define('PLUGIN_NETSTATCONNECTIONS_MAX_GLPI', '12.0.0');
 
@@ -35,9 +38,6 @@ include_once __DIR__ . '/hook.php';
 function plugin_init_netstatconnections(): void {
     global $PLUGIN_HOOKS;
 
-    // DIAGNOSTIC: confirms plugin_init is being called
-    error_log('[netstatconnections] plugin_init called for URI=' . ($_SERVER['REQUEST_URI'] ?? 'cli'));
-
     $PLUGIN_HOOKS['csrf_compliant']['netstatconnections'] = true;
 
     // Register classes
@@ -56,45 +56,7 @@ function plugin_init_netstatconnections(): void {
         'PluginNetstatconnectionsPort'
     ];
 
-    // PRE_INVENTORY hook — plain function wrapper defined in hook.php
-    $PLUGIN_HOOKS['pre_inventory']['netstatconnections']
-        = 'plugin_netstatconnections_pre_inventory';
-
-    // DIAGNOSTIC: register for SEVERAL inventory-flow hooks to see which fire
-    $PLUGIN_HOOKS['post_inventory']['netstatconnections']
-        = 'plugin_netstatconnections_diag_post_inventory';
-    $PLUGIN_HOOKS['inventory_get_params']['netstatconnections']
-        = 'plugin_netstatconnections_diag_get_params';
-    $PLUGIN_HOOKS['handle_inventory_task']['netstatconnections']
-        = 'plugin_netstatconnections_diag_handle_inv';
-
-    // FIX: Force-add ourselves to Plugin::$activated_plugins via reflection.
-    // GLPI 11 stateless inventory route runs Plugin::load() (firing this init)
-    // but doesn't fully run Plugin::init(), so $activated_plugins stays empty.
-    // doHook() then skips us with isPluginActive() check returning false.
-    try {
-        $ref = new \ReflectionClass(\Plugin::class);
-        if ($ref->hasProperty('activated_plugins')) {
-            $prop = $ref->getProperty('activated_plugins');
-            $prop->setAccessible(true);
-            $current = $prop->getValue();
-            if (is_array($current) && !in_array('netstatconnections', $current, true)) {
-                $current[] = 'netstatconnections';
-                $prop->setValue(null, $current);
-                error_log('[netstatconnections] FIX: force-added to Plugin::$activated_plugins');
-            }
-        }
-    } catch (\Throwable $e) {
-        error_log('[netstatconnections] FIX failed: ' . $e->getMessage());
-    }
-
-    // DIAGNOSTIC: log hook registration state
-    error_log('[netstatconnections] AFTER registration: '
-        . 'function_exists=' . (function_exists('plugin_netstatconnections_pre_inventory') ? 'Y' : 'N')
-        . ', isPluginActive=' . (\Plugin::isPluginActive('netstatconnections') ? 'Y' : 'N')
-        . ', hook_entry=' . var_export($PLUGIN_HOOKS['pre_inventory']['netstatconnections'] ?? 'MISSING', true));
-
-    // Firewall bypasses — STRATEGY_NO_CHECK for endpoints that don't need a session.
+    // Firewall bypasses for unauthenticated agent endpoints.
     // GLPI 11 Symfony router intercepts all requests including static files.
     if (class_exists('\Glpi\Http\Firewall')) {
         // vis-network JS/CSS served through PHP passthrough (public MIT library)
@@ -103,10 +65,17 @@ function plugin_init_netstatconnections(): void {
             '#^/front/vis-asset\.php#',
             \Glpi\Http\Firewall::STRATEGY_NO_CHECK
         );
-        // Agent config endpoint — agents fetch collection settings (not sensitive)
+        // Agent config endpoint — agents fetch collection settings + push token
         \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts(
             'netstatconnections',
             '#^/front/agentconfig\.php#',
+            \Glpi\Http\Firewall::STRATEGY_NO_CHECK
+        );
+        // Push endpoint — agents POST connection data after inventory cycle.
+        // Authenticated via Bearer token in Authorization header (validated in push.php).
+        \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts(
+            'netstatconnections',
+            '#^/front/push\.php#',
             \Glpi\Http\Firewall::STRATEGY_NO_CHECK
         );
     }

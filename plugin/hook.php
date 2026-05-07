@@ -298,32 +298,6 @@ function plugin_netstatconnections_install(): bool {
     return true;
 }
 
-/**
- * PRE_INVENTORY hook wrapper — plain function avoids class autoloading issues.
- * GLPI's doHook() calls: call_user_func('plugin_netstatconnections_pre_inventory', $data)
- * $data is a stdClass — object mutations persist (PHP passes objects by handle).
- */
-function plugin_netstatconnections_pre_inventory(mixed $data): mixed {
-    error_log('[netstatconnections] PRE_INVENTORY hook wrapper called');
-    @file_put_contents('/var/log/glpi/netstatconnections.log',
-        '[' . date('Y-m-d H:i:s') . "] hook wrapper called\n", FILE_APPEND | LOCK_EX);
-    return PluginNetstatconnectionsInventoryhandler::preInventory($data);
-}
-
-// DIAGNOSTIC functions to detect which hooks actually fire
-function plugin_netstatconnections_diag_post_inventory($data) {
-    error_log('[netstatconnections] DIAG: post_inventory hook FIRED');
-    return $data;
-}
-function plugin_netstatconnections_diag_get_params($params) {
-    error_log('[netstatconnections] DIAG: inventory_get_params hook FIRED');
-    return $params;
-}
-function plugin_netstatconnections_diag_handle_inv($params) {
-    error_log('[netstatconnections] DIAG: handle_inventory_task hook FIRED');
-    return $params;
-}
-
 function plugin_netstatconnections_uninstall(): bool {
     global $DB;
 

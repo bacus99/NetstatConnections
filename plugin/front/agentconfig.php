@@ -16,6 +16,9 @@ header('Cache-Control: no-cache, no-store, must-revalidate');
 
 $config = PluginNetstatconnectionsAgentconfig::get();
 
+// Include the push token so agents can authenticate to push.php
+$config['push_token'] = PluginNetstatconnectionsAgentconfig::getToken();
+
 // Future: per-computer or per-entity overrides could be resolved here
 // using $_GET['hostname'] or $_GET['deviceid'] to look up the computer
 // and return entity-specific settings.

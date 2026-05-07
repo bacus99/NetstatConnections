@@ -4,12 +4,14 @@
  * Manages agent collection configuration — stored in the config key-value table.
  *
  * Global defaults are served to every agent via agentconfig.php.
- * Agents fetch this JSON before each collection cycle and apply the settings
- * instead of (or as a fallback for) a local netstat-collect.ini file.
+ * Agents fetch this JSON before each collection cycle and apply the settings.
+ *
+ * Also manages the push token used to authenticate agent POSTs to push.php.
  */
 class PluginNetstatconnectionsAgentconfig {
 
     const CONFIG_KEY = 'agent_collection';
+    const TOKEN_KEY  = 'push_token';
 
     const DEFAULTS = [
         'established_only'         => true,
@@ -70,6 +72,72 @@ class PluginNetstatconnectionsAgentconfig {
                 'value' => $json,
             ]);
         }
+    }
+
+    /**
+     * Get the push token. Generates a new one if missing.
+     */
+    public static function getToken(): string {
+        global $DB;
+        if (!$DB->tableExists('glpi_plugin_netstatconnections_config')) {
+            return '';
+        }
+        $row = $DB->request([
+            'SELECT' => ['value'],
+            'FROM'   => 'glpi_plugin_netstatconnections_config',
+            'WHERE'  => ['key' => self::TOKEN_KEY],
+            'LIMIT'  => 1,
+        ])->current();
+
+        if ($row && !empty($row['value'])) {
+            return (string)$row['value'];
+        }
+
+        // Generate and persist a new token
+        $token = bin2hex(random_bytes(32));
+        $DB->insert('glpi_plugin_netstatconnections_config', [
+            'key'   => self::TOKEN_KEY,
+            'value' => $token,
+        ]);
+        return $token;
+    }
+
+    /**
+     * Validate a token presented by an agent.
+     */
+    public static function validateToken(string $presented): bool {
+        $valid = self::getToken();
+        if ($valid === '' || $presented === '') {
+            return false;
+        }
+        return hash_equals($valid, $presented);
+    }
+
+    /**
+     * Regenerate the push token (admin action — invalidates all agents).
+     */
+    public static function regenerateToken(): string {
+        global $DB;
+        $token = bin2hex(random_bytes(32));
+
+        $existing = $DB->request([
+            'FROM'  => 'glpi_plugin_netstatconnections_config',
+            'WHERE' => ['key' => self::TOKEN_KEY],
+            'LIMIT' => 1,
+        ])->current();
+
+        if ($existing) {
+            $DB->update('glpi_plugin_netstatconnections_config',
+                ['value' => $token],
+                ['key'   => self::TOKEN_KEY]
+            );
+        } else {
+            $DB->insert('glpi_plugin_netstatconnections_config', [
+                'key'   => self::TOKEN_KEY,
+                'value' => $token,
+            ]);
+        }
+        return $token;
     }
 
     /**

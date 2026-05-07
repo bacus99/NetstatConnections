@@ -8,8 +8,13 @@ use parent 'GLPI::Agent::Task::Inventory::Module';
 use File::Spec;
 use English qw(-no_match_vars);
 use JSON::PP;
+use HTTP::Request;
+use LWP::UserAgent;
 
 use constant    category    => "network";
+
+# ── Constants ────────────────────────────────────────────────────────────────
+my $AGENT_ROOT_DEFAULT = 'C:/Program Files/GLPI-Agent';
 
 sub isEnabled {
     my (%params) = @_;
@@ -26,7 +31,7 @@ sub doInventory {
     my $config    = $params{config};
 
     # ── Run collector ─────────────────────────────────────────────────
-    my $agent_root = $ENV{GLPI_AGENT_ROOT} // 'C:/Program Files/GLPI-Agent';
+    my $agent_root = $ENV{GLPI_AGENT_ROOT} // $AGENT_ROOT_DEFAULT;
     my $collector  = File::Spec->catfile($agent_root, 'glpi-netstat-collect.pl');
     my $perl       = File::Spec->catfile($agent_root, 'perl', 'bin', 'glpi-agent.exe');
 
@@ -59,68 +64,27 @@ sub doInventory {
     $logger->debug("Connections module: cache schema=$data->{schema_version} method=$method")
         if $logger;
 
-    # ── Inject into inventory content directly ────────────────────────
-    # addEntry() rejects unknown section names ("No field support").
-    # getContent() returns a NEW Protocol::Inventory wrapper each call
-    # (in JSON mode), so modifications to it are discarded before send.
-    # Write to the raw internal hash ($inventory->{content}) instead —
-    # this is the hash that getContent() copies from during serialization.
-    # The PRE_INVENTORY hook on the server extracts these sections
-    # before GLPI schema validation, so they never cause rejection.
-    my $content = $inventory->{content};
+    # ── Push to GLPI plugin endpoint ─────────────────────────────────
+    # We do NOT inject into the inventory payload — GLPI 11's stateless
+    # inventory route bootstrap-skips plugins before the pre_inventory
+    # hook fires, so custom keys would be rejected by schema validation.
+    # Instead we POST a separate request to the plugin's push.php which
+    # is exempt from session/auth (uses Bearer token).
+    my $pushed = _push($config, $logger, $data, $method);
 
-    # ── Connections ───────────────────────────────────────────────────
-    my $conn_count = 0;
-    $content->{NETWORK_CONNECTIONS} //= [];
-    for my $c (@{$data->{connections} // []}) {
-        my $entry = {
-            PROTOCOL          => $c->{protocol}        // '',
-            LOCAL_ADDR        => $c->{local_addr}      // '',
-            LOCAL_PORT        => $c->{local_port}      // 0,
-            REMOTE_ADDR       => $c->{remote_addr}     // '',
-            REMOTE_PORT       => $c->{remote_port}     // 0,
-            REMOTE_HOSTNAME   => $c->{remote_hostname} // '',
-            PROCESS_NAME      => $c->{process_name}    // '',
-            SERVICE_NAME      => $c->{service_name}    // '',
-            STATE             => $c->{state}           // '',
-            CREATED_AT        => $c->{created_at}      // '',
-            OFFLOAD_STATE     => $c->{offload_state}   // '',
-            APPLIED_SETTING   => $c->{applied_setting} // '',
-            COLLECTION_METHOD => $method,
-            CONN_DIRECTION    => $c->{conn_direction}   // 'outbound',
-            SERVICE_PORT      => $c->{service_port}     // $c->{remote_port} // 0,
-        };
-        _clean($entry);
-        push @{$content->{NETWORK_CONNECTIONS}}, $entry;
-        $conn_count++;
+    if ($pushed) {
+        my $cn = scalar @{$data->{connections} // []};
+        my $pn = scalar @{$data->{listening}   // []};
+        $logger->info("Connections module: pushed $cn connections, $pn listening ports [$method]")
+            if $logger;
     }
-
-    # ── Listening ports ──────────────────────────────────────────────
-    my $port_count = 0;
-    $content->{LISTENING_PORTS} //= [];
-    for my $p (@{$data->{listening} // []}) {
-        my $entry = {
-            PROTOCOL     => $p->{protocol}     // '',
-            LOCAL_ADDR   => $p->{local_addr}   // '',
-            LOCAL_PORT   => $p->{local_port}   // 0,
-            PROCESS_NAME => $p->{process_name} // '',
-            SERVICE_NAME => $p->{service_name} // '',
-            CREATED_AT   => $p->{created_at}   // '',
-        };
-        _clean($entry);
-        push @{$content->{LISTENING_PORTS}}, $entry;
-        $port_count++;
-    }
-
-    $logger->info("Connections module: injected $conn_count connections, $port_count listening ports [$method]")
-        if $logger;
 }
 
 sub _loadCache {
     my ($config, $logger) = @_;
     my $vardir = ($config && $config->{vardir})
         ? $config->{vardir}
-        : ($ENV{GLPI_AGENT_ROOT} // 'C:/Program Files/GLPI-Agent') . '/var';
+        : ($ENV{GLPI_AGENT_ROOT} // $AGENT_ROOT_DEFAULT) . '/var';
     my $cache_file = File::Spec->catfile($vardir, 'netstat-cache.json');
 
     open(my $fh, '<', $cache_file) or do {
@@ -139,9 +103,97 @@ sub _loadCache {
     return $data;
 }
 
-sub _clean {
-    my ($h) = @_;
-    delete $h->{$_} for grep { !defined $h->{$_} || $h->{$_} eq '' } keys %$h;
+# ── Push connections to GLPI plugin endpoint ─────────────────────────
+sub _push {
+    my ($config, $logger, $data, $method) = @_;
+
+    # Resolve GLPI server URL from agent config
+    my $glpi_url = '';
+    if ($config && $config->{server}) {
+        my $server = $config->{server};
+        if (ref($server) eq 'ARRAY' && @$server) {
+            $glpi_url = $server->[0];
+        } elsif (!ref($server)) {
+            $glpi_url = $server;
+        }
+    }
+    unless ($glpi_url) {
+        $logger->debug("Connections module: no GLPI server URL — skipping push") if $logger;
+        return 0;
+    }
+    $glpi_url =~ s{/+$}{};
+    # If the URL ends with /front/inventory.php, strip it to get base
+    $glpi_url =~ s{/front/inventory\.php$}{};
+
+    my $config_url = "$glpi_url/plugins/netstatconnections/front/agentconfig.php";
+    my $push_url   = "$glpi_url/plugins/netstatconnections/front/push.php";
+
+    # Fetch the push token from agentconfig.php
+    my $ua = LWP::UserAgent->new(
+        timeout => 30,
+        ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0x00 },
+    );
+    $ua->agent("GLPI-Agent-NetstatConnections/2.1.0");
+
+    my $cfg_resp = $ua->get($config_url);
+    unless ($cfg_resp->is_success) {
+        $logger->error("Connections module: failed to fetch agent config from $config_url ("
+            . $cfg_resp->status_line . ")") if $logger;
+        return 0;
+    }
+
+    my $server_cfg = eval { decode_json($cfg_resp->decoded_content) };
+    if ($@ || !ref($server_cfg) eq 'HASH') {
+        $logger->error("Connections module: invalid JSON from agentconfig.php: $@") if $logger;
+        return 0;
+    }
+
+    my $token = $server_cfg->{push_token} // '';
+    unless ($token) {
+        $logger->error("Connections module: agentconfig.php returned no push_token") if $logger;
+        return 0;
+    }
+
+    # Determine hostname
+    my $hostname = $data->{hostname};
+    unless ($hostname) {
+        # Fallback: from environment / system
+        $hostname = $ENV{COMPUTERNAME} // `hostname`;
+        chomp $hostname if defined $hostname;
+    }
+
+    # Build payload
+    my $payload = {
+        hostname          => $hostname,
+        collected_at      => $data->{collected_at} // _now(),
+        collection_method => $method,
+        connections       => $data->{connections} // [],
+        listening         => $data->{listening}   // [],
+    };
+
+    my $json = encode_json($payload);
+
+    my $req = HTTP::Request->new(POST => $push_url);
+    $req->header('Content-Type'  => 'application/json');
+    $req->header('Authorization' => "Bearer $token");
+    $req->content($json);
+
+    my $resp = $ua->request($req);
+    if (!$resp->is_success) {
+        $logger->error("Connections module: push failed " . $resp->status_line
+            . " from $push_url: " . $resp->decoded_content) if $logger;
+        return 0;
+    }
+
+    $logger->debug("Connections module: push response: " . $resp->decoded_content)
+        if $logger;
+    return 1;
+}
+
+sub _now {
+    my @t = localtime;
+    return sprintf("%04d-%02d-%02d %02d:%02d:%02d",
+        $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
 }
 
 1;

@@ -18,7 +18,7 @@ echo '<div class="card-header"><h3 class="card-title">'
     . '</h3></div>';
 echo '<div class="card-body">';
 echo '<p class="text-muted">'
-    . __('The Perl module runs inside the GLPI Agent service and injects network connections into the standard inventory payload — no custom endpoint or token required.', 'netstatconnections')
+    . __('The Perl module runs inside the GLPI Agent service. After each inventory cycle, it fetches collection settings + push token from the GLPI server, then POSTs the connection data to the plugin push endpoint.', 'netstatconnections')
     . '</p>';
 echo '<div class="alert alert-info mb-0">';
 echo '<h5><i class="ti ti-info-circle me-1"></i>' . __('Installation steps', 'netstatconnections') . '</h5>';
@@ -28,8 +28,14 @@ echo '<li>' . sprintf(
     '<code>agent/perl/agent/GLPI/Agent/Task/Inventory/Generic/Connections.pm</code>',
     '<code>C:\Program Files\GLPI-Agent\perl\agent\GLPI\Agent\Task\Inventory\Generic\Connections.pm</code>'
 ) . '</li>';
-echo '<li>' . __('Configure collection filters via <strong>Collection Settings</strong> above — agents fetch them automatically. No manual .ini deployment needed.', 'netstatconnections') . '</li>';
-echo '<li>' . __('Restart the GLPI Agent service. Connections will appear in the next inventory cycle.', 'netstatconnections') . '</li>';
+echo '<li>' . sprintf(
+    __('Copy %s to %s on each managed server.', 'netstatconnections'),
+    '<code>agent/glpi-netstat-collect.pl</code>',
+    '<code>C:\Program Files\GLPI-Agent\glpi-netstat-collect.pl</code>'
+) . '</li>';
+echo '<li>' . __('Configure collection filters via <strong>Collection Settings</strong> — agents fetch them (and the push token) automatically.', 'netstatconnections') . '</li>';
+echo '<li>' . __('Ensure the agent\'s server URL points to the GLPI base (e.g. https://glpi.example.com/glpi/). The push endpoint URL is derived automatically.', 'netstatconnections') . '</li>';
+echo '<li>' . __('Restart the GLPI Agent service. Connections will appear after the next inventory cycle.', 'netstatconnections') . '</li>';
 echo '</ol>';
 echo '</div>';
 echo '</div></div></div>';

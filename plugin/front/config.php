@@ -22,6 +22,13 @@ $can_update = Session::haveRight('config', UPDATE);
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $can_update) {
     Session::checkCSRF($_POST);
 
+    // Token regeneration
+    if (isset($_POST['regenerate_token'])) {
+        PluginNetstatconnectionsAgentconfig::regenerateToken();
+        Session::addMessageAfterRedirect(__('Push token regenerated — all agents must refetch via agentconfig.php', 'netstatconnections'), true, INFO);
+        Html::redirect($_SERVER['PHP_SELF']);
+    }
+
     $new_cfg = [
         'established_only'         => isset($_POST['established_only']) ? true : false,
         'skip_ipv6'                => isset($_POST['skip_ipv6']) ? true : false,
@@ -179,33 +186,70 @@ if ($can_update) {
 
 echo '</form>';
 
-// ── Info card: Agent endpoint ────────────────────────────────────────────────
-$endpoint_url = Plugin::getWebDir('netstatconnections', true) . '/front/agentconfig.php';
+// ── Info card: Agent endpoints ───────────────────────────────────────────────
+$webdir       = Plugin::getWebDir('netstatconnections', true);
+$config_url   = $webdir . '/front/agentconfig.php';
+$push_url     = $webdir . '/front/push.php';
+$push_token   = PluginNetstatconnectionsAgentconfig::getToken();
 
 echo '<div class="card mb-4">';
 echo '<div class="card-header"><h3 class="card-title">'
     . '<i class="ti ti-cloud-download me-2"></i>'
-    . __('Agent Config Endpoint', 'netstatconnections')
+    . __('Agent Endpoints', 'netstatconnections')
     . '</h3></div>';
 echo '<div class="card-body">';
 echo '<p class="text-muted">'
-    . __('Agents fetch these settings automatically before each collection cycle. No manual .ini file deployment needed.', 'netstatconnections')
+    . __('Agents fetch settings + push token automatically from the config endpoint, then POST connection data to the push endpoint after each inventory cycle.', 'netstatconnections')
     . '</p>';
 
-echo '<div class="input-group mb-3" style="max-width:600px">';
-echo '<input type="text" class="form-control font-monospace" id="endpoint_url" readonly '
-    . 'value="' . htmlspecialchars($endpoint_url) . '">';
+// Config endpoint URL
+echo '<label class="form-label fw-bold mb-1">' . __('Config endpoint (GET)', 'netstatconnections') . '</label>';
+echo '<div class="input-group mb-3" style="max-width:700px">';
+echo '<input type="text" class="form-control font-monospace" id="config_url" readonly value="'
+    . htmlspecialchars($config_url) . '">';
 echo '<button class="btn btn-outline-secondary" type="button" onclick="'
-    . 'navigator.clipboard.writeText(document.getElementById(\'endpoint_url\').value);'
-    . 'this.innerHTML=\'<i class=\\\'ti ti-check\\\'></i>\';'
-    . 'setTimeout(()=>this.innerHTML=\'<i class=\\\'ti ti-copy\\\'></i>\',1500)">'
+    . 'navigator.clipboard.writeText(document.getElementById(\'config_url\').value)">'
     . '<i class="ti ti-copy"></i></button>';
 echo '</div>';
 
-echo '<div class="alert alert-info mb-0">';
-echo '<i class="ti ti-info-circle me-1"></i>'
-    . __('The collector script reads this endpoint at the start of each run. '
-    . 'If the endpoint is unreachable, the agent falls back to the local netstat-collect.ini file.', 'netstatconnections');
+// Push endpoint URL
+echo '<label class="form-label fw-bold mb-1">' . __('Push endpoint (POST + Bearer token)', 'netstatconnections') . '</label>';
+echo '<div class="input-group mb-3" style="max-width:700px">';
+echo '<input type="text" class="form-control font-monospace" id="push_url" readonly value="'
+    . htmlspecialchars($push_url) . '">';
+echo '<button class="btn btn-outline-secondary" type="button" onclick="'
+    . 'navigator.clipboard.writeText(document.getElementById(\'push_url\').value)">'
+    . '<i class="ti ti-copy"></i></button>';
+echo '</div>';
+
+// Push token (sensitive — show only to update users)
+if ($can_update) {
+    echo '<label class="form-label fw-bold mb-1">' . __('Push token (sensitive)', 'netstatconnections') . '</label>';
+    echo '<div class="input-group mb-2" style="max-width:700px">';
+    echo '<input type="password" class="form-control font-monospace" id="push_token" readonly value="'
+        . htmlspecialchars($push_token) . '">';
+    echo '<button class="btn btn-outline-secondary" type="button" onclick="'
+        . 'var f=document.getElementById(\'push_token\');f.type=f.type===\'password\'?\'text\':\'password\'">'
+        . '<i class="ti ti-eye"></i></button>';
+    echo '<button class="btn btn-outline-secondary" type="button" onclick="'
+        . 'navigator.clipboard.writeText(document.getElementById(\'push_token\').value)">'
+        . '<i class="ti ti-copy"></i></button>';
+    echo '</div>';
+
+    echo '<form method="POST" action="" onsubmit="return confirm(\''
+        . __('Regenerate push token? All agents will be unable to push until they refetch from agentconfig.php (happens automatically on next cycle).', 'netstatconnections')
+        . '\')">';
+    echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken(true)]);
+    echo Html::hidden('regenerate_token', ['value' => '1']);
+    echo '<button type="submit" class="btn btn-outline-warning btn-sm">';
+    echo '<i class="ti ti-refresh me-1"></i>' . __('Regenerate token', 'netstatconnections');
+    echo '</button>';
+    echo '</form>';
+}
+
+echo '<div class="alert alert-info mt-3 mb-0">';
+echo '<i class="ti ti-info-circle me-1"></i>';
+echo __('Agents need only the GLPI base URL configured (e.g. https://glpi.example.com/glpi/). The plugin endpoints are derived automatically.', 'netstatconnections');
 echo '</div>';
 
 echo '</div></div>';
