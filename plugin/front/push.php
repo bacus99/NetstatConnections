@@ -28,11 +28,30 @@
  *
  * No GLPI session required — STRATEGY_NO_CHECK bypass registered in setup.php.
  */
-// GLPI 11 routes ALL requests through public/index.php which bootstraps
-// $DB, autoloaders, and plugin classes BEFORE our script runs. Do NOT
-// include inc/includes.php — that's a backward-compat stub that interferes.
-// Our plugin classes (PluginNetstatconnectionsAgentconfig etc) are
-// autoloaded on first use via the autoloader registered in setup.php.
+// GLPI 11 bootstraps via public/index.php BEFORE this script runs (provides
+// vendor/autoload.php, core classes, sometimes $DB). However for POST
+// requests with STRATEGY_NO_CHECK firewall bypass, neither $DB nor our
+// plugin's autoloader are guaranteed to be initialized. Bootstrap defensively.
+
+// 1. Explicitly require our plugin classes (the autoloader from setup.php
+//    may not be registered yet on this code path).
+require_once __DIR__ . '/../inc/agentconfig.class.php';
+require_once __DIR__ . '/../inc/connection.class.php';
+
+// 2. Initialize $DB if missing.
+global $DB;
+if (!isset($DB) || !$DB) {
+    if (file_exists('/etc/glpi/config_db.php')) {
+        require_once '/etc/glpi/config_db.php';
+    } elseif (file_exists(__DIR__ . '/../../../config/config_db.php')) {
+        require_once __DIR__ . '/../../../config/config_db.php';
+    }
+    if (class_exists('DB')) {
+        $DB = new \DB();
+    } elseif (class_exists('DBmysql')) {
+        $DB = new \DBmysql();
+    }
+}
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
