@@ -9,7 +9,7 @@
  * No GLPI session required — STRATEGY_NO_CHECK bypass registered in setup.php.
  * The config data is not sensitive (just filter settings).
  */
-include('../../../inc/includes.php');
+include(__DIR__ . '/../../../inc/includes.php');
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-cache, no-store, must-revalidate');
