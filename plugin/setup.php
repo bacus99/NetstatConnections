@@ -80,18 +80,9 @@ function plugin_init_netstatconnections(): void {
         );
     }
 
-    // Register stateless paths so GLPI doesn't start a session, redirect to
-    // login, or perform CSRF/anti-bot checks for these agent endpoints.
-    if (class_exists('\Glpi\Http\SessionManager')) {
-        if (method_exists('\Glpi\Http\SessionManager', 'registerPluginStatelessPath')) {
-            \Glpi\Http\SessionManager::registerPluginStatelessPath(
-                '#^/plugins/netstatconnections/front/(agentconfig|push)\.php#'
-            );
-            \Glpi\Http\SessionManager::registerPluginStatelessPath(
-                '#^/marketplace/netstatconnections/front/(agentconfig|push)\.php#'
-            );
-        }
-    }
+    // SessionManager stateless registration removed: agentconfig.php works
+    // fine without it, and adding it caused $DB to be null in push.php for
+    // POST requests. STRATEGY_NO_CHECK alone is sufficient.
 }
 
 function plugin_version_netstatconnections(): array {
