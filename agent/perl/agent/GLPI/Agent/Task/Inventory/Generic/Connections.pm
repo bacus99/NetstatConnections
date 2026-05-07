@@ -222,20 +222,18 @@ sub _findServerUrl {
         }
     }
 
-    # Try 3: Windows registry
+    # Try 3: Windows registry via `reg query` (no Perl module dependency)
     if ($^O eq 'MSWin32') {
-        my $url = eval {
-            require Win32::TieRegistry;
-            Win32::TieRegistry->import();
-            my $key = $Win32::TieRegistry::Registry->Open(
-                'LMachine\\SOFTWARE\\GLPI-Agent\\', { Access => 0x20019 }
-            );
-            return undef unless $key;
-            return $key->{'/server'};
-        };
-        if ($url) {
-            $logger->debug("Connections module: server URL from registry: $url") if $logger;
-            return $url;
+        for my $hive ('HKLM', 'HKCU') {
+            my $output = `reg query $hive\\SOFTWARE\\GLPI-Agent /v server 2>nul`;
+            if ($output && $output =~ /server\s+REG_SZ\s+(\S.+?)\s*$/m) {
+                my $url = $1;
+                $url =~ s/\s+$//;
+                if ($url) {
+                    $logger->debug("Connections module: server URL from registry ($hive): $url") if $logger;
+                    return $url;
+                }
+            }
         }
     }
 
