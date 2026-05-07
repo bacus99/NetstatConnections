@@ -157,13 +157,15 @@ sub _push {
         chomp $hostname if defined $hostname;
     }
 
-    # Build payload
+    # Build payload — include token in body too, since Apache often strips
+    # the Authorization header before PHP sees it (mod_php-fpm + proxy quirks)
     my $payload = {
         hostname          => $hostname,
         collected_at      => $data->{collected_at} // _now(),
         collection_method => $method,
         connections       => $data->{connections} // [],
         listening         => $data->{listening}   // [],
+        token             => $token,
     };
 
     my $json = encode_json($payload);
