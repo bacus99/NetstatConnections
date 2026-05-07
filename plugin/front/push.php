@@ -29,24 +29,31 @@
  * No GLPI session required — STRATEGY_NO_CHECK bypass registered in setup.php.
  */
 // Defensive bootstrap for STRATEGY_NO_CHECK POST requests.
-// 1. Composer autoloader (provides core classes like CommonDBTM, Plugin, DBmysql)
 $glpi_root = realpath(__DIR__ . '/../../..');
+
+// 1. Define constants GLPI core needs (GLPI_CONFIG_DIR, etc).
+//    Order matters: define BEFORE Composer autoload so DBConnection can find config.
+if (!defined('GLPI_CONFIG_DIR')) {
+    define('GLPI_CONFIG_DIR', is_dir('/etc/glpi') ? '/etc/glpi' : $glpi_root . '/config');
+}
+// Load full constants file (defines GLPI_LOG_DIR, GLPI_VAR_DIR, etc.)
+if (file_exists($glpi_root . '/src/autoload/constants.php')) {
+    require_once $glpi_root . '/src/autoload/constants.php';
+}
+
+// 2. Composer autoloader
 if (file_exists($glpi_root . '/vendor/autoload.php')) {
     require_once $glpi_root . '/vendor/autoload.php';
 }
 
-// 2. Plugin classes
+// 3. Plugin classes
 require_once __DIR__ . '/../inc/agentconfig.class.php';
 require_once __DIR__ . '/../inc/connection.class.php';
 
-// 3. Initialize $DB via GLPI's official DBConnection (connects on construct)
+// 4. Connect $DB
 global $DB;
 if (!isset($DB) || !$DB || !$DB->tableExists('glpi_computers')) {
-    if (file_exists('/etc/glpi/config_db.php')) {
-        require_once '/etc/glpi/config_db.php';
-    } elseif (file_exists($glpi_root . '/config/config_db.php')) {
-        require_once $glpi_root . '/config/config_db.php';
-    }
+    require_once GLPI_CONFIG_DIR . '/config_db.php';
     if (class_exists('DBConnection') && method_exists('DBConnection', 'establishDBConnection')) {
         \DBConnection::establishDBConnection(true, false);
     } elseif (class_exists('DB')) {
