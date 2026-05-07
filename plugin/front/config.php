@@ -50,7 +50,7 @@ echo '</div>';
 // ── Settings form ────────────────────────────────────────────────────────────
 echo '<div class="container-fluid">';
 echo '<form method="POST" action="">';
-echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken()]);
+echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken(true)]);
 
 // Card: Collection Filters
 echo '<div class="card mb-4">';
