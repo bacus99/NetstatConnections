@@ -61,6 +61,12 @@ function plugin_init_netstatconnections(): void {
     $PLUGIN_HOOKS['pre_inventory']['netstatconnections']
         = 'plugin_netstatconnections_pre_inventory';
 
+    // DIAGNOSTIC: log hook registration state
+    error_log('[netstatconnections] AFTER registration: '
+        . 'function_exists=' . (function_exists('plugin_netstatconnections_pre_inventory') ? 'Y' : 'N')
+        . ', isPluginActive=' . (\Plugin::isPluginActive('netstatconnections') ? 'Y' : 'N')
+        . ', hook_entry=' . var_export($PLUGIN_HOOKS['pre_inventory']['netstatconnections'] ?? 'MISSING', true));
+
     // Firewall bypasses — STRATEGY_NO_CHECK for endpoints that don't need a session.
     // GLPI 11 Symfony router intercepts all requests including static files.
     if (class_exists('\Glpi\Http\Firewall')) {
