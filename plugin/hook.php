@@ -7,7 +7,7 @@
 function plugin_netstatconnections_install(): bool {
     global $DB;
 
-    // ── plugin config table ───────────────────────────────────────────
+    // ── plugin config table (key-value) ─────────────────────────────────
     if (!$DB->tableExists('glpi_plugin_netstatconnections_config')) {
         $DB->doQuery("CREATE TABLE `glpi_plugin_netstatconnections_config` (
             `key`   VARCHAR(100) NOT NULL,
@@ -16,27 +16,33 @@ function plugin_netstatconnections_install(): bool {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
     }
 
-    // Generate push_token if not set
-    $existing = $DB->request([
-        'SELECT' => ['value'],
-        'FROM'   => 'glpi_plugin_netstatconnections_config',
-        'WHERE'  => ['key' => 'push_token'],
-        'LIMIT'  => 1,
+    // Seed default agent collection config if absent
+    $existing_cfg = $DB->request([
+        'FROM'  => 'glpi_plugin_netstatconnections_config',
+        'WHERE' => ['key' => 'agent_collection'],
+        'LIMIT' => 1,
     ])->current();
-
-    if (!$existing || empty($existing['value'])) {
-        $token = bin2hex(random_bytes(32)); // 64-char hex token
+    if (!$existing_cfg) {
         $DB->insert('glpi_plugin_netstatconnections_config', [
-            'key'   => 'push_token',
-            'value' => $token,
+            'key'   => 'agent_collection',
+            'value' => json_encode([
+                'established_only'         => true,
+                'skip_ipv6'                => true,
+                'skip_loopback'            => true,
+                'ephemeral_port_threshold' => 49152,
+                'exclude_processes'        => [],
+                'exclude_remote_ips'       => [],
+                'exclude_remote_ports'     => [],
+                'include_only_ips'         => [],
+            ], JSON_PRETTY_PRINT),
         ]);
     }
 
     // ── connections table ──────────────────────────────────────────────
     if (!$DB->tableExists('glpi_plugin_netstatconnections_connections')) {
         $DB->doQuery("CREATE TABLE `glpi_plugin_netstatconnections_connections` (
-            `id`                INT(11)      NOT NULL AUTO_INCREMENT,
-            `computers_id`      INT(11)      NOT NULL DEFAULT 0,
+            `id`                INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `computers_id`      INT UNSIGNED NOT NULL DEFAULT 0,
             `protocol`          VARCHAR(10)  NOT NULL DEFAULT '',
             `local_addr`        VARCHAR(50)  NOT NULL DEFAULT '',
             `local_port`        SMALLINT UNSIGNED NOT NULL DEFAULT 0,
@@ -47,10 +53,12 @@ function plugin_netstatconnections_install(): bool {
             `service_name`      VARCHAR(255) NOT NULL DEFAULT '',
             `state`             VARCHAR(20)  NOT NULL DEFAULT '',
             `collected_at`      TIMESTAMP    NULL DEFAULT NULL,
+            `last_seen`         TIMESTAMP    NULL DEFAULT NULL,
+            `connection_status` ENUM('active','closed') NOT NULL DEFAULT 'active',
             `created_at`        TIMESTAMP    NULL DEFAULT NULL,
             `is_locked`         TINYINT(1)   NOT NULL DEFAULT 0,
-            `impact_direction`  ENUM('depends','impacts') NOT NULL DEFAULT 'impacts',
-            `remote_items_id`   INT(11)      DEFAULT NULL,
+            `impact_direction`  ENUM('depends','impacts') DEFAULT NULL,
+            `remote_items_id`   INT UNSIGNED DEFAULT NULL,
             `remote_itemtype`   VARCHAR(100) DEFAULT NULL,
             `remote_scope`      VARCHAR(20)  DEFAULT NULL,
             `resolved_via`      ENUM('glpi_ip','dns','unresolved','lock','autolock','sibling','db_instance') DEFAULT NULL,
@@ -61,66 +69,134 @@ function plugin_netstatconnections_install(): bool {
             `offload_state`     VARCHAR(50)  DEFAULT NULL,
             `applied_setting`   VARCHAR(50)  DEFAULT NULL,
             PRIMARY KEY (`id`),
-            KEY `computers_id`   (`computers_id`),
-            KEY `remote_addr`    (`remote_addr`),
-            KEY `is_locked`      (`is_locked`),
-            KEY `remote_items_id`(`remote_items_id`),
-            KEY `collected_at`   (`collected_at`)
+            KEY `computers_id`      (`computers_id`),
+            KEY `remote_addr`       (`remote_addr`),
+            KEY `is_locked`         (`is_locked`),
+            KEY `remote_items_id`   (`remote_items_id`),
+            KEY `collected_at`      (`collected_at`),
+            KEY `last_seen`         (`last_seen`),
+            KEY `connection_status` (`connection_status`),
+            KEY `resolved_via`      (`resolved_via`(20))
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
     }
 
     // ── Upgrade: add columns if missing ───────────────────────────────
     $conn_cols = [
-        'remote_items_id'   => "INT(11) DEFAULT NULL AFTER `impact_direction`",
+        'last_seen'         => "TIMESTAMP NULL DEFAULT NULL AFTER `collected_at`",
+        'connection_status' => "ENUM('active','closed') NOT NULL DEFAULT 'active' AFTER `last_seen`",
+        'created_at'        => "TIMESTAMP NULL DEFAULT NULL AFTER `connection_status`",
+        'remote_items_id'   => "INT UNSIGNED DEFAULT NULL AFTER `impact_direction`",
         'remote_itemtype'   => "VARCHAR(100) DEFAULT NULL AFTER `remote_items_id`",
         'remote_scope'      => "VARCHAR(20) DEFAULT NULL AFTER `remote_itemtype`",
-        'resolved_via'      => "ENUM('glpi_ip','dns','unresolved','lock','autolock','db_instance') DEFAULT NULL AFTER `remote_scope`",
+        'resolved_via'      => "ENUM('glpi_ip','dns','unresolved','lock','autolock','sibling','db_instance') DEFAULT NULL AFTER `remote_scope`",
         'resolved_at'       => "TIMESTAMP NULL DEFAULT NULL AFTER `resolved_via`",
         'conn_direction'    => "VARCHAR(10) DEFAULT NULL AFTER `resolved_at`",
         'service_port'      => "SMALLINT UNSIGNED DEFAULT NULL AFTER `conn_direction`",
         'collection_method' => "VARCHAR(20) DEFAULT NULL AFTER `service_port`",
         'offload_state'     => "VARCHAR(50) DEFAULT NULL AFTER `collection_method`",
         'applied_setting'   => "VARCHAR(50) DEFAULT NULL AFTER `offload_state`",
-        'created_at'        => "TIMESTAMP NULL DEFAULT NULL AFTER `collected_at`",
     ];
 
+    $table = 'glpi_plugin_netstatconnections_connections';
     foreach ($conn_cols as $col => $def) {
-        if (!$DB->fieldExists('glpi_plugin_netstatconnections_connections', $col)) {
-            $DB->doQuery("ALTER TABLE `glpi_plugin_netstatconnections_connections` ADD `{$col}` {$def};");
+        if (!$DB->fieldExists($table, $col)) {
+            $DB->doQuery("ALTER TABLE `{$table}` ADD `{$col}` {$def};");
         }
     }
 
-    // Upgrade resolved_via ENUM if 'lock' and 'autolock' missing
-    if ($DB->fieldExists('glpi_plugin_netstatconnections_connections', 'resolved_via')) {
-        $res = $DB->doQuery("SHOW COLUMNS FROM `glpi_plugin_netstatconnections_connections` WHERE Field = 'resolved_via'");
+    // Backfill lifecycle columns
+    $DB->doQuery("UPDATE `{$table}` SET `last_seen` = `collected_at`, `connection_status` = 'active' WHERE `last_seen` IS NULL");
+
+    // Upgrade resolved_via ENUM to include all values
+    if ($DB->fieldExists($table, 'resolved_via')) {
+        $res = $DB->doQuery("SHOW COLUMNS FROM `{$table}` WHERE Field = 'resolved_via'");
         $col_info = $DB->fetchAssoc($res);
         if ($col_info && strpos($col_info['Type'], 'db_instance') === false) {
-            $DB->doQuery("ALTER TABLE `glpi_plugin_netstatconnections_connections` MODIFY `resolved_via` ENUM('glpi_ip','dns','unresolved','lock','autolock','sibling','db_instance') DEFAULT NULL;");
+            $DB->doQuery("ALTER TABLE `{$table}` MODIFY `resolved_via` ENUM('glpi_ip','dns','unresolved','lock','autolock','sibling','db_instance') DEFAULT NULL;");
+        }
+    }
+
+    // Fix computers_id and remote_items_id to INT UNSIGNED on existing installs
+    foreach (['computers_id' => 'INT UNSIGNED NOT NULL DEFAULT 0', 'remote_items_id' => 'INT UNSIGNED DEFAULT NULL'] as $col => $typedef) {
+        if ($DB->fieldExists($table, $col)) {
+            $res      = $DB->doQuery("SHOW COLUMNS FROM `{$table}` WHERE Field = '{$col}'");
+            $col_info = $DB->fetchAssoc($res);
+            if ($col_info && stripos($col_info['Type'], 'unsigned') === false) {
+                $DB->doQuery("ALTER TABLE `{$table}` MODIFY `{$col}` {$typedef};");
+            }
+        }
+    }
+
+    // Make impact_direction nullable (unlock writes NULL, not '')
+    if ($DB->fieldExists($table, 'impact_direction')) {
+        $res      = $DB->doQuery("SHOW COLUMNS FROM `{$table}` WHERE Field = 'impact_direction'");
+        $col_info = $DB->fetchAssoc($res);
+        if ($col_info && $col_info['Null'] === 'NO') {
+            $DB->doQuery("ALTER TABLE `{$table}` MODIFY `impact_direction` ENUM('depends','impacts') DEFAULT NULL");
+        }
+    }
+
+    // Indexes (try/catch — silently skip if already exists)
+    foreach ([
+        "ALTER TABLE `{$table}` ADD INDEX `last_seen`         (`last_seen`)",
+        "ALTER TABLE `{$table}` ADD INDEX `connection_status` (`connection_status`)",
+        "ALTER TABLE `{$table}` ADD INDEX `resolved_via`      (`resolved_via`(20))",
+    ] as $idx_sql) {
+        try { $DB->doQuery($idx_sql); } catch (\Throwable $e) {}
+    }
+
+    // ── relation types table ──────────────────────────────────────────
+    if (!$DB->tableExists('glpi_plugin_netstatconnections_relationtypes')) {
+        $DB->doQuery("CREATE TABLE `glpi_plugin_netstatconnections_relationtypes` (
+            `id`            INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name`          VARCHAR(255) NOT NULL DEFAULT '',
+            `color`         VARCHAR(10)  NOT NULL DEFAULT '#6c757d',
+            `comment`       TEXT         DEFAULT NULL,
+            `is_deleted`    TINYINT(1)   NOT NULL DEFAULT 0,
+            `date_creation` TIMESTAMP    NULL DEFAULT NULL,
+            `date_mod`      TIMESTAMP    NULL DEFAULT NULL,
+            PRIMARY KEY (`id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
+
+        foreach ([
+            ['Communicates',  '#0d6efd'],
+            ['Database',      '#dc3545'],
+            ['Replicates',    '#e83e8c'],
+            ['Authenticates', '#20c997'],
+            ['Administers',   '#fd7e14'],
+            ['Monitors',      '#6c757d'],
+            ['File Share',    '#795548'],
+            ['Mail',          '#ffc107'],
+        ] as [$rname, $rcolor]) {
+            $DB->insert('glpi_plugin_netstatconnections_relationtypes', [
+                'name'  => $rname,
+                'color' => $rcolor,
+            ]);
         }
     }
 
     // ── ports table ───────────────────────────────────────────────────
     if (!$DB->tableExists('glpi_plugin_netstatconnections_ports')) {
         $DB->doQuery("CREATE TABLE `glpi_plugin_netstatconnections_ports` (
-            `id`             INT(11)      NOT NULL AUTO_INCREMENT,
-            `name`           VARCHAR(255) NOT NULL DEFAULT '',
-            `port_number`    SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-            `protocol`       VARCHAR(10)  NOT NULL DEFAULT 'TCP',
-            `color`          VARCHAR(10)  NOT NULL DEFAULT '#6c757d',
-            `direction`      ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
-            `auto_lock`          TINYINT(1)   NOT NULL DEFAULT 0,
-            `auto_direction`     ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
-            `is_database_port`   TINYINT(1)   NOT NULL DEFAULT 0,
-            `comment`            TEXT         DEFAULT NULL,
-            `is_deleted`     TINYINT(1)   NOT NULL DEFAULT 0,
-            `date_creation`  TIMESTAMP    NULL DEFAULT NULL,
-            `date_mod`       TIMESTAMP    NULL DEFAULT NULL,
+            `id`               INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `name`             VARCHAR(255) NOT NULL DEFAULT '',
+            `port_number`      SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+            `protocol`         VARCHAR(10)  NOT NULL DEFAULT 'TCP',
+            `color`            VARCHAR(10)  NOT NULL DEFAULT '#6c757d',
+            `direction`        ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
+            `auto_lock`        TINYINT(1)   NOT NULL DEFAULT 0,
+            `auto_direction`   ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
+            `is_database_port` TINYINT(1)   NOT NULL DEFAULT 0,
+            `relation_types_id` INT UNSIGNED DEFAULT NULL,
+            `comment`          TEXT         DEFAULT NULL,
+            `is_deleted`       TINYINT(1)   NOT NULL DEFAULT 0,
+            `date_creation`    TIMESTAMP    NULL DEFAULT NULL,
+            `date_mod`         TIMESTAMP    NULL DEFAULT NULL,
             PRIMARY KEY (`id`),
             UNIQUE KEY `port_proto` (`port_number`, `protocol`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
 
-        // Seed default port definitions
-        $defaults = [
+        foreach ([
             [21,   'FTP',        'TCP', '#17a2b8'],
             [22,   'SSH',        'TCP', '#28a745'],
             [25,   'SMTP',       'TCP', '#ffc107'],
@@ -142,11 +218,9 @@ function plugin_netstatconnections_install(): bool {
             [5723, 'SCOM',       'TCP', '#6c757d'],
             [5985, 'WinRM',      'TCP', '#17a2b8'],
             [8080, 'HTTP-Alt',   'TCP', '#6f42c1'],
-            [8403, 'SCOM-GW',   'TCP', '#6c757d'],
-            [10123,'SCOM-Web',  'TCP', '#6c757d'],
-        ];
-
-        foreach ($defaults as [$port, $name, $proto, $color]) {
+            [8403, 'SCOM-GW',    'TCP', '#6c757d'],
+            [10123,'SCOM-Web',   'TCP', '#6c757d'],
+        ] as [$port, $name, $proto, $color]) {
             $DB->insert('glpi_plugin_netstatconnections_ports', [
                 'name'        => $name,
                 'port_number' => $port,
@@ -158,11 +232,12 @@ function plugin_netstatconnections_install(): bool {
         }
     }
 
-    // Upgrade: add port columns if missing
+    // Upgrade ports table: add columns if missing
     foreach ([
-        'auto_lock'        => "TINYINT(1) NOT NULL DEFAULT 0",
-        'auto_direction'   => "ENUM('impacts','depends') NOT NULL DEFAULT 'impacts'",
-        'is_database_port' => "TINYINT(1) NOT NULL DEFAULT 0",
+        'auto_lock'          => "TINYINT(1) NOT NULL DEFAULT 0",
+        'auto_direction'     => "ENUM('impacts','depends') NOT NULL DEFAULT 'impacts'",
+        'is_database_port'   => "TINYINT(1) NOT NULL DEFAULT 0",
+        'relation_types_id'  => "INT UNSIGNED DEFAULT NULL",
     ] as $col => $def) {
         if (!$DB->fieldExists('glpi_plugin_netstatconnections_ports', $col)) {
             $DB->doQuery("ALTER TABLE `glpi_plugin_netstatconnections_ports` ADD `{$col}` {$def};");
@@ -174,35 +249,46 @@ function plugin_netstatconnections_install(): bool {
         SET `is_database_port` = 1
         WHERE `port_number` IN (1433,1521,3306,5432,5022) AND `protocol` = 'TCP'");
 
-    // v1.3.0 Pillar 2: is_database_port flag
-    if (!$DB->fieldExists('glpi_plugin_netstatconnections_ports', 'is_database_port')) {
-        $DB->doQuery("ALTER TABLE `glpi_plugin_netstatconnections_ports` ADD `is_database_port` TINYINT(1) NOT NULL DEFAULT 0 AFTER `auto_direction`;");
-        // Seed known DB ports
-        $db_ports = [1433, 5022, 3306, 1521, 5432, 27017];
-        $DB->update('glpi_plugin_netstatconnections_ports', [
-            'is_database_port' => 1,
-        ], ['port_number' => $db_ports]);
-    }
-
-    // v1.2.0 lifecycle migration
-    $table = 'glpi_plugin_netstatconnections_connections';
-    if ($DB->tableExists($table)) {
-        if (!$DB->fieldExists($table, 'last_seen')) {
-            $DB->doQuery("ALTER TABLE `{$table}` ADD COLUMN `last_seen` TIMESTAMP NULL DEFAULT NULL AFTER `collected_at`");
+    // Auto-assign relation types to seeded ports (only where NULL — safe to re-run)
+    if ($DB->tableExists('glpi_plugin_netstatconnections_relationtypes')) {
+        $rt_ids = [];
+        foreach ($DB->request(['FROM' => 'glpi_plugin_netstatconnections_relationtypes']) as $r) {
+            $rt_ids[$r['name']] = (int)$r['id'];
         }
-        if (!$DB->fieldExists($table, 'connection_status')) {
-            $DB->doQuery("ALTER TABLE `{$table}` ADD COLUMN `connection_status` ENUM('active','closed') NOT NULL DEFAULT 'active' AFTER `last_seen`");
-        }
-        // Backfill
-        $DB->doQuery("UPDATE `{$table}` SET `last_seen` = `collected_at`, `connection_status` = 'active' WHERE `last_seen` IS NULL");
 
-        // Indexes for cron performance (MySQL silently ignores IF EXISTS equivalent via try/catch)
         foreach ([
-            "ALTER TABLE `{$table}` ADD INDEX `last_seen`         (`last_seen`)",
-            "ALTER TABLE `{$table}` ADD INDEX `connection_status` (`connection_status`)",
-            "ALTER TABLE `{$table}` ADD INDEX `resolved_via`      (`resolved_via`(20))",
-        ] as $idx_sql) {
-            try { $DB->doQuery($idx_sql); } catch (\Throwable $e) { /* already exists */ }
+            [1433,  'TCP', 'Database'],
+            [1521,  'TCP', 'Database'],
+            [3306,  'TCP', 'Database'],
+            [5432,  'TCP', 'Database'],
+            [5022,  'TCP', 'Replicates'],
+            [389,   'TCP', 'Authenticates'],
+            [22,    'TCP', 'Administers'],
+            [3389,  'TCP', 'Administers'],
+            [5985,  'TCP', 'Administers'],
+            [5723,  'TCP', 'Monitors'],
+            [8403,  'TCP', 'Monitors'],
+            [10123, 'TCP', 'Monitors'],
+            [445,   'TCP', 'File Share'],
+            [21,    'TCP', 'File Share'],
+            [25,    'TCP', 'Mail'],
+            [110,   'TCP', 'Mail'],
+            [143,   'TCP', 'Mail'],
+            [80,    'TCP', 'Communicates'],
+            [443,   'TCP', 'Communicates'],
+            [8080,  'TCP', 'Communicates'],
+            [135,   'TCP', 'Communicates'],
+            [53,    'TCP', 'Communicates'],
+            [53,    'UDP', 'Communicates'],
+        ] as [$pnum, $proto, $rtype]) {
+            if (!isset($rt_ids[$rtype])) continue;
+            $DB->doQuery(
+                "UPDATE `glpi_plugin_netstatconnections_ports`
+                 SET `relation_types_id` = " . (int)$rt_ids[$rtype] . "
+                 WHERE `port_number` = " . (int)$pnum . "
+                   AND `protocol`    = '" . $DB->escape($proto) . "'
+                   AND (`relation_types_id` IS NULL OR `relation_types_id` = 0)"
+            );
         }
     }
 
@@ -218,6 +304,7 @@ function plugin_netstatconnections_uninstall(): bool {
     foreach ([
         'glpi_plugin_netstatconnections_connections',
         'glpi_plugin_netstatconnections_ports',
+        'glpi_plugin_netstatconnections_relationtypes',
         'glpi_plugin_netstatconnections_config',
     ] as $table) {
         if ($DB->tableExists($table)) {

@@ -86,6 +86,75 @@ info("NetStat collector v$VERSION starting on $hostname");
 dbg("PowerShell mode: Get-NetTCPConnection + Get-NetUDPEndpoint");
 
 # ---------------------------------------------------------------------------
+# Auto-detect GLPI server URL if not in INI
+# ---------------------------------------------------------------------------
+if (!$config{glpi_url}) {
+    my @agent_cfgs = (
+        File::Spec->catfile($agent_root_dir, 'etc', 'agent.cfg'),
+        File::Spec->catfile($agent_root_dir, 'etc', 'conf.d', 'local.cfg'),
+        '/etc/glpi-agent/agent.cfg',
+        '/etc/glpi-agent/conf.d/local.cfg',
+    );
+    for my $acf (@agent_cfgs) {
+        next unless -f $acf;
+        open my $afh, '<', $acf or next;
+        while (<$afh>) {
+            chomp;
+            if (/^\s*server\s*=\s*(\S+)/i) {
+                $config{glpi_url} = $1;
+                $config{glpi_url} =~ s|/+$||;
+                dbg("Auto-detected GLPI URL from agent config: $config{glpi_url}");
+                last;
+            }
+        }
+        close $afh;
+        last if $config{glpi_url};
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Fetch server-pushed collection config (if GLPI URL known)
+# ---------------------------------------------------------------------------
+if ($config{glpi_url}) {
+    my $server_cfg = _fetchServerConfig($config{glpi_url}, $hostname);
+    if ($server_cfg) {
+        info("Using server-pushed collection settings");
+        # Override collection scalars
+        for my $k (qw(established_only skip_ipv6 skip_loopback ephemeral_port_threshold)) {
+            if (exists $server_cfg->{$k}) {
+                my $v = $server_cfg->{$k};
+                $config{$k} = ref($v) ? $v
+                             : ($v =~ /^(true|1)$/i) ? 1
+                             : ($v =~ /^(false|0)$/i) ? 0
+                             : $v;
+                dbg("  $k = $config{$k}");
+            }
+        }
+        # Override exclusion/inclusion lists
+        if (exists $server_cfg->{exclude_processes}) {
+            @excl_procs = @{ $server_cfg->{exclude_processes} // [] };
+            dbg("  exclude_processes: " . scalar(@excl_procs) . " entries");
+        }
+        if (exists $server_cfg->{exclude_remote_ips}) {
+            @excl_remote_ips = @{ $server_cfg->{exclude_remote_ips} // [] };
+            dbg("  exclude_remote_ips: " . scalar(@excl_remote_ips) . " entries");
+        }
+        if (exists $server_cfg->{exclude_remote_ports}) {
+            @excl_remote_ports = map { int($_) } @{ $server_cfg->{exclude_remote_ports} // [] };
+            dbg("  exclude_remote_ports: " . scalar(@excl_remote_ports) . " entries");
+        }
+        if (exists $server_cfg->{include_only_ips}) {
+            @incl_only_ips = @{ $server_cfg->{include_only_ips} // [] };
+            dbg("  include_only_ips: " . scalar(@incl_only_ips) . " entries");
+        }
+    } else {
+        dbg("Server config not available, using local INI settings");
+    }
+} else {
+    dbg("No GLPI URL configured, using local INI settings only");
+}
+
+# ---------------------------------------------------------------------------
 # Step 1 — HTTP.SYS port detection (Windows only)
 # ---------------------------------------------------------------------------
 my %httpsys_ports;
@@ -1134,6 +1203,42 @@ sub _splitAddrPort {
         return ($1, $2 eq '*' ? 0 : int($2));
     }
     return ($s, 0);
+}
+
+sub _fetchServerConfig {
+    my ($glpi_url, $host) = @_;
+
+    eval { require LWP::UserAgent };
+    if ($@) {
+        dbg("LWP::UserAgent not available — cannot fetch server config");
+        return undef;
+    }
+
+    # Build endpoint URL
+    $glpi_url =~ s|/+$||;
+    my $url = "$glpi_url/plugins/netstatconnections/front/agentconfig.php";
+    $url .= "?hostname=" . ($host // '') if $host;
+
+    dbg("Fetching server config from: $url");
+
+    my $ua = LWP::UserAgent->new(
+        timeout  => 10,
+        ssl_opts => { verify_hostname => 0 },
+        agent    => "glpi-netstat-collect/$VERSION",
+    );
+
+    my $resp = $ua->get($url);
+    if ($resp->is_success) {
+        my $json = eval { JSON::PP::decode_json($resp->decoded_content) };
+        if ($@ || ref($json) ne 'HASH') {
+            dbg("Invalid JSON from server config endpoint");
+            return undef;
+        }
+        return $json;
+    }
+
+    dbg("Server config endpoint: " . $resp->status_line);
+    return undef;
 }
 
 sub _loadINI {
