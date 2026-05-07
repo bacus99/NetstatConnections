@@ -36,15 +36,11 @@ if (file_exists($glpi_root . '/vendor/autoload.php')) {
 
 include($glpi_root . '/inc/includes.php');
 
-// STRATEGY_NO_CHECK skips plugin bootstrap; force-load our plugin so its
-// autoloader becomes available.
-if (class_exists('Plugin')) {
-    Plugin::load('netstatconnections', true);
-} else {
-    // Fallback: include our class files directly
-    require_once __DIR__ . '/../inc/agentconfig.class.php';
-    require_once __DIR__ . '/../inc/connection.class.php';
-}
+// Plugin::load() requires GLPI_PLUGINS_DIRECTORIES which isn't defined in
+// stateless bootstrap. Composer autoloader handles core classes (CommonDBTM
+// etc.); just require our plugin classes directly.
+require_once __DIR__ . '/../inc/agentconfig.class.php';
+require_once __DIR__ . '/../inc/connection.class.php';
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');

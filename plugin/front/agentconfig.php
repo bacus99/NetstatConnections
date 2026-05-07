@@ -15,11 +15,7 @@ if (file_exists($glpi_root . '/vendor/autoload.php')) {
 }
 include($glpi_root . '/inc/includes.php');
 
-if (class_exists('Plugin')) {
-    Plugin::load('netstatconnections', true);
-} else {
-    require_once __DIR__ . '/../inc/agentconfig.class.php';
-}
+require_once __DIR__ . '/../inc/agentconfig.class.php';
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-cache, no-store, must-revalidate');
