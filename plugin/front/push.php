@@ -28,23 +28,24 @@
  *
  * No GLPI session required — STRATEGY_NO_CHECK bypass registered in setup.php.
  */
-// GLPI 11 bootstraps via public/index.php BEFORE this script runs (provides
-// vendor/autoload.php, core classes, sometimes $DB). However for POST
-// requests with STRATEGY_NO_CHECK firewall bypass, neither $DB nor our
-// plugin's autoloader are guaranteed to be initialized. Bootstrap defensively.
+// Defensive bootstrap for STRATEGY_NO_CHECK POST requests.
+// 1. Composer autoloader (provides core classes like CommonDBTM, Plugin, DBmysql)
+$glpi_root = realpath(__DIR__ . '/../../..');
+if (file_exists($glpi_root . '/vendor/autoload.php')) {
+    require_once $glpi_root . '/vendor/autoload.php';
+}
 
-// 1. Explicitly require our plugin classes (the autoloader from setup.php
-//    may not be registered yet on this code path).
+// 2. Plugin classes
 require_once __DIR__ . '/../inc/agentconfig.class.php';
 require_once __DIR__ . '/../inc/connection.class.php';
 
-// 2. Initialize $DB if missing.
+// 3. Initialize $DB if missing
 global $DB;
 if (!isset($DB) || !$DB) {
     if (file_exists('/etc/glpi/config_db.php')) {
         require_once '/etc/glpi/config_db.php';
-    } elseif (file_exists(__DIR__ . '/../../../config/config_db.php')) {
-        require_once __DIR__ . '/../../../config/config_db.php';
+    } elseif (file_exists($glpi_root . '/config/config_db.php')) {
+        require_once $glpi_root . '/config/config_db.php';
     }
     if (class_exists('DB')) {
         $DB = new \DB();
