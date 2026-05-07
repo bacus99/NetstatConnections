@@ -53,11 +53,10 @@ function plugin_init_netstatconnections(): void {
         'PluginNetstatconnectionsPort'
     ];
 
-    // PRE_INVENTORY hook — extracts NETWORK_CONNECTIONS before schema validation
-    $PLUGIN_HOOKS['pre_inventory']['netstatconnections'] = [
-        'PluginNetstatconnectionsInventoryhandler',
-        'preInventory'
-    ];
+    // PRE_INVENTORY hook — plain function wrapper defined in hook.php
+    // Avoids class autoloading issues; hook.php is always included by doHook()
+    $PLUGIN_HOOKS['pre_inventory']['netstatconnections']
+        = 'plugin_netstatconnections_pre_inventory';
 
     // Firewall bypasses — STRATEGY_NO_CHECK for endpoints that don't need a session.
     // GLPI 11 Symfony router intercepts all requests including static files.

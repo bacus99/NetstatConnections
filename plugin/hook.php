@@ -298,6 +298,16 @@ function plugin_netstatconnections_install(): bool {
     return true;
 }
 
+/**
+ * PRE_INVENTORY hook wrapper — plain function avoids class autoloading issues.
+ * GLPI's doHook() calls: call_user_func('plugin_netstatconnections_pre_inventory', $data)
+ * $data is a stdClass — object mutations persist (PHP passes objects by handle).
+ */
+function plugin_netstatconnections_pre_inventory(mixed $data): mixed {
+    Toolbox::logInFile('netstatconnections', "=== preInventory hook fired ===\n");
+    return PluginNetstatconnectionsInventoryhandler::preInventory($data);
+}
+
 function plugin_netstatconnections_uninstall(): bool {
     global $DB;
 
