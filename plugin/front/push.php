@@ -30,6 +30,11 @@
  */
 include(__DIR__ . '/../../../inc/includes.php');
 
+// STRATEGY_NO_CHECK skips plugin bootstrap, so the autoloader from setup.php
+// isn't registered. Require our classes directly.
+require_once __DIR__ . '/../inc/agentconfig.class.php';
+require_once __DIR__ . '/../inc/connection.class.php';
+
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
 

@@ -11,6 +11,9 @@
  */
 include(__DIR__ . '/../../../inc/includes.php');
 
+// STRATEGY_NO_CHECK skips plugin bootstrap; require our classes directly.
+require_once __DIR__ . '/../inc/agentconfig.class.php';
+
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-cache, no-store, must-revalidate');
 
