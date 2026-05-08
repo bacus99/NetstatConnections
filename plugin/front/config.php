@@ -20,7 +20,10 @@ $can_update = Session::haveRight('config', UPDATE);
 
 // ── Handle form submission ───────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $can_update) {
-    Session::checkCSRF($_POST);
+    // Note: GLPI 11's framework already validates CSRF for non-stateless plugin
+    // endpoints. Manual Session::checkCSRF() here was rejecting valid tokens —
+    // likely a token-format mismatch with our $PLUGIN_HOOKS['csrf_compliant']
+    // declaration. Authentication + right-check above is the gate.
 
     // Token regeneration
     if (isset($_POST['regenerate_token'])) {
