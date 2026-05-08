@@ -56,7 +56,7 @@ function plugin_netstatconnections_install(): bool {
             `last_seen`         TIMESTAMP    NULL DEFAULT NULL,
             `connection_status` ENUM('active','closed') NOT NULL DEFAULT 'active',
             `created_at`        TIMESTAMP    NULL DEFAULT NULL,
-            `is_locked`         TINYINT(1)   NOT NULL DEFAULT 0,
+            `is_locked`         TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `impact_direction`  ENUM('depends','impacts') DEFAULT NULL,
             `remote_items_id`   INT UNSIGNED DEFAULT NULL,
             `remote_itemtype`   VARCHAR(100) DEFAULT NULL,
@@ -116,13 +116,38 @@ function plugin_netstatconnections_install(): bool {
         }
     }
 
-    // Fix computers_id and remote_items_id to INT UNSIGNED on existing installs
-    foreach (['computers_id' => 'INT UNSIGNED NOT NULL DEFAULT 0', 'remote_items_id' => 'INT UNSIGNED DEFAULT NULL'] as $col => $typedef) {
-        if ($DB->fieldExists($table, $col)) {
-            $res      = $DB->doQuery("SHOW COLUMNS FROM `{$table}` WHERE Field = '{$col}'");
+    // Fix all integer columns to UNSIGNED on existing installs (GLPI 11 requirement)
+    $unsigned_cols = [
+        'glpi_plugin_netstatconnections_connections' => [
+            'id'              => 'INT UNSIGNED NOT NULL AUTO_INCREMENT',
+            'computers_id'    => 'INT UNSIGNED NOT NULL DEFAULT 0',
+            'local_port'      => 'SMALLINT UNSIGNED NOT NULL DEFAULT 0',
+            'remote_port'     => 'SMALLINT UNSIGNED NOT NULL DEFAULT 0',
+            'is_locked'       => 'TINYINT UNSIGNED NOT NULL DEFAULT 0',
+            'remote_items_id' => 'INT UNSIGNED DEFAULT NULL',
+            'service_port'    => 'SMALLINT UNSIGNED DEFAULT NULL',
+        ],
+        'glpi_plugin_netstatconnections_ports' => [
+            'id'                => 'INT UNSIGNED NOT NULL AUTO_INCREMENT',
+            'port_number'       => 'SMALLINT UNSIGNED NOT NULL DEFAULT 0',
+            'auto_lock'         => 'TINYINT UNSIGNED NOT NULL DEFAULT 0',
+            'is_database_port'  => 'TINYINT UNSIGNED NOT NULL DEFAULT 0',
+            'relation_types_id' => 'INT UNSIGNED DEFAULT NULL',
+            'is_deleted'        => 'TINYINT UNSIGNED NOT NULL DEFAULT 0',
+        ],
+        'glpi_plugin_netstatconnections_relationtypes' => [
+            'id'         => 'INT UNSIGNED NOT NULL AUTO_INCREMENT',
+            'is_deleted' => 'TINYINT UNSIGNED NOT NULL DEFAULT 0',
+        ],
+    ];
+    foreach ($unsigned_cols as $tbl => $cols) {
+        if (!$DB->tableExists($tbl)) continue;
+        foreach ($cols as $col => $typedef) {
+            if (!$DB->fieldExists($tbl, $col)) continue;
+            $res      = $DB->doQuery("SHOW COLUMNS FROM `{$tbl}` WHERE Field = '{$col}'");
             $col_info = $DB->fetchAssoc($res);
             if ($col_info && stripos($col_info['Type'], 'unsigned') === false) {
-                $DB->doQuery("ALTER TABLE `{$table}` MODIFY `{$col}` {$typedef};");
+                $DB->doQuery("ALTER TABLE `{$tbl}` MODIFY `{$col}` {$typedef};");
             }
         }
     }
@@ -152,7 +177,7 @@ function plugin_netstatconnections_install(): bool {
             `name`          VARCHAR(255) NOT NULL DEFAULT '',
             `color`         VARCHAR(10)  NOT NULL DEFAULT '#6c757d',
             `comment`       TEXT         DEFAULT NULL,
-            `is_deleted`    TINYINT(1)   NOT NULL DEFAULT 0,
+            `is_deleted`    TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `date_creation` TIMESTAMP    NULL DEFAULT NULL,
             `date_mod`      TIMESTAMP    NULL DEFAULT NULL,
             PRIMARY KEY (`id`)
@@ -184,12 +209,12 @@ function plugin_netstatconnections_install(): bool {
             `protocol`         VARCHAR(10)  NOT NULL DEFAULT 'TCP',
             `color`            VARCHAR(10)  NOT NULL DEFAULT '#6c757d',
             `direction`        ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
-            `auto_lock`        TINYINT(1)   NOT NULL DEFAULT 0,
+            `auto_lock`        TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `auto_direction`   ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
-            `is_database_port` TINYINT(1)   NOT NULL DEFAULT 0,
+            `is_database_port` TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `relation_types_id` INT UNSIGNED DEFAULT NULL,
             `comment`          TEXT         DEFAULT NULL,
-            `is_deleted`       TINYINT(1)   NOT NULL DEFAULT 0,
+            `is_deleted`       TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `date_creation`    TIMESTAMP    NULL DEFAULT NULL,
             `date_mod`         TIMESTAMP    NULL DEFAULT NULL,
             PRIMARY KEY (`id`),
@@ -234,9 +259,9 @@ function plugin_netstatconnections_install(): bool {
 
     // Upgrade ports table: add columns if missing
     foreach ([
-        'auto_lock'          => "TINYINT(1) NOT NULL DEFAULT 0",
+        'auto_lock'          => "TINYINT UNSIGNED NOT NULL DEFAULT 0",
         'auto_direction'     => "ENUM('impacts','depends') NOT NULL DEFAULT 'impacts'",
-        'is_database_port'   => "TINYINT(1) NOT NULL DEFAULT 0",
+        'is_database_port'   => "TINYINT UNSIGNED NOT NULL DEFAULT 0",
         'relation_types_id'  => "INT UNSIGNED DEFAULT NULL",
     ] as $col => $def) {
         if (!$DB->fieldExists('glpi_plugin_netstatconnections_ports', $col)) {
