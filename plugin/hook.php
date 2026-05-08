@@ -55,7 +55,7 @@ function plugin_netstatconnections_install(): bool {
             `collected_at`      TIMESTAMP    NULL DEFAULT NULL,
             `last_seen`         TIMESTAMP    NULL DEFAULT NULL,
             `connection_status` ENUM('active','closed') NOT NULL DEFAULT 'active',
-            `created_at`        TIMESTAMP    NULL DEFAULT NULL,
+            `created_at`        DATETIME     NULL DEFAULT NULL,
             `is_locked`         TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `impact_direction`  ENUM('depends','impacts') DEFAULT NULL,
             `remote_items_id`   INT UNSIGNED DEFAULT NULL,
@@ -84,7 +84,7 @@ function plugin_netstatconnections_install(): bool {
     $conn_cols = [
         'last_seen'         => "TIMESTAMP NULL DEFAULT NULL AFTER `collected_at`",
         'connection_status' => "ENUM('active','closed') NOT NULL DEFAULT 'active' AFTER `last_seen`",
-        'created_at'        => "TIMESTAMP NULL DEFAULT NULL AFTER `connection_status`",
+        'created_at'        => "DATETIME NULL DEFAULT NULL AFTER `connection_status`",
         'remote_items_id'   => "INT UNSIGNED DEFAULT NULL AFTER `impact_direction`",
         'remote_itemtype'   => "VARCHAR(100) DEFAULT NULL AFTER `remote_items_id`",
         'remote_scope'      => "VARCHAR(20) DEFAULT NULL AFTER `remote_itemtype`",
@@ -149,6 +149,19 @@ function plugin_netstatconnections_install(): bool {
             if ($col_info && stripos($col_info['Type'], 'unsigned') === false) {
                 $DB->doQuery("ALTER TABLE `{$tbl}` MODIFY `{$col}` {$typedef};");
             }
+        }
+    }
+
+    // Upgrade created_at from TIMESTAMP to DATETIME (broader range, no '0000-00-00' issue)
+    if ($DB->fieldExists($table, 'created_at')) {
+        $res      = $DB->doQuery("SHOW COLUMNS FROM `{$table}` WHERE Field = 'created_at'");
+        $col_info = $DB->fetchAssoc($res);
+        if ($col_info && stripos($col_info['Type'], 'datetime') === false) {
+            // Null out any zero-dates first to avoid strict-mode conversion errors
+            try {
+                $DB->doQuery("UPDATE `{$table}` SET `created_at` = NULL WHERE `created_at` < '1900-01-01'");
+            } catch (\Throwable $e) { /* ignore */ }
+            $DB->doQuery("ALTER TABLE `{$table}` MODIFY `created_at` DATETIME NULL DEFAULT NULL");
         }
     }
 
