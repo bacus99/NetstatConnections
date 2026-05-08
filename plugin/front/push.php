@@ -175,7 +175,15 @@ foreach ($connections as $c) {
     if (!empty($include_only_ips) && !in_array($raddr, $include_only_ips, true)) { $skipped['include_only']++; continue; }
     if ($skip_loopback && ($is_loopback($raddr) || $is_loopback($laddr))) { $skipped['loopback']++; continue; }
     if ($skip_ipv6 && ($is_ipv6($raddr) || $is_ipv6($laddr)))          { $skipped['ipv6']++;        continue; }
-    if ($ephemeral_threshold > 0 && $rport >= $ephemeral_threshold)   { $skipped['ephemeral']++;   continue; }
+    // Ephemeral filter: drop ONLY when BOTH ports are ephemeral (peer-to-peer noise).
+    // Inbound (local=service, remote=ephemeral) and outbound (local=ephemeral, remote=service)
+    // must both be kept. Otherwise we'd lose every inbound MSSQL/HTTPS/etc connection.
+    $lport = (int)($c['local_port'] ?? 0);
+    if ($ephemeral_threshold > 0
+        && $rport >= $ephemeral_threshold
+        && $lport >= $ephemeral_threshold) {
+        $skipped['ephemeral']++; continue;
+    }
     if ($established_only && $state !== '' && !in_array($state, ['ESTABLISHED', 'CLOSE_WAIT', 'TIME_WAIT'], true)) {
         $skipped['state']++; continue;
     }

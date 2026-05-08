@@ -115,10 +115,17 @@ sub _push {
             if $logger;
         return 0;
     }
-    $logger->debug("Connections module: using GLPI server URL: $glpi_url") if $logger;
+    # Normalize URL — agents may point at glpiinventory plugin paths or legacy
+    # endpoints. Strip trailing path components down to the GLPI root, since
+    # our plugin lives at /plugins/netstatconnections/.
     $glpi_url =~ s{/+$}{};
-    # If the URL ends with /front/inventory.php, strip it to get base
-    $glpi_url =~ s{/front/inventory\.php$}{};
+    $glpi_url =~ s{/front/inventory\.php$}{}i;
+    $glpi_url =~ s{/marketplace/[^/]+/?$}{}i;
+    $glpi_url =~ s{/plugins/[^/]+/?$}{}i;
+    $glpi_url =~ s{/marketplace/[^/]+/.*$}{}i;
+    $glpi_url =~ s{/plugins/[^/]+/.*$}{}i;
+    $glpi_url =~ s{/+$}{};
+    $logger->debug("Connections module: normalized GLPI base URL: $glpi_url") if $logger;
 
     my $config_url = "$glpi_url/plugins/netstatconnections/front/agentconfig.php";
     my $push_url   = "$glpi_url/plugins/netstatconnections/front/push.php";
