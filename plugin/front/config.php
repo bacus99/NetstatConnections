@@ -57,7 +57,7 @@ echo '</div>';
 // ── Settings form ────────────────────────────────────────────────────────────
 echo '<div class="container-fluid">';
 echo '<form method="POST" action="">';
-echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken(true)]);
+echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken()]);
 
 // Card: Collection Filters
 echo '<div class="card mb-4">';
@@ -239,7 +239,7 @@ if ($can_update) {
     echo '<form method="POST" action="" onsubmit="return confirm(\''
         . __('Regenerate push token? All agents will be unable to push until they refetch from agentconfig.php (happens automatically on next cycle).', 'netstatconnections')
         . '\')">';
-    echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken(true)]);
+    echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken()]);
     echo Html::hidden('regenerate_token', ['value' => '1']);
     echo '<button type="submit" class="btn btn-outline-warning btn-sm">';
     echo '<i class="ti ti-refresh me-1"></i>' . __('Regenerate token', 'netstatconnections');
