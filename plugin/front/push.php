@@ -133,6 +133,57 @@ $method      = (string)($body['collection_method'] ?? 'netstat');
 $collected   = (string)($body['collected_at']      ?? date('Y-m-d H:i:s'));
 $connections = is_array($body['connections'] ?? null) ? $body['connections'] : [];
 
+// ── Apply server-side filters (from agent_collection config) ─────────────
+// This way: admin changes filters in UI → take effect immediately for next push.
+// No agent redeploy needed.
+$cfg_stmt = $pdo->prepare("SELECT value FROM glpi_plugin_netstatconnections_config WHERE `key` = 'agent_collection' LIMIT 1");
+$cfg_stmt->execute();
+$cfg_json = $cfg_stmt->fetchColumn();
+$server_cfg = $cfg_json ? json_decode($cfg_json, true) : [];
+if (!is_array($server_cfg)) { $server_cfg = []; }
+
+$exclude_processes    = array_map('strtolower', $server_cfg['exclude_processes']    ?? []);
+$exclude_remote_ips   = $server_cfg['exclude_remote_ips']   ?? [];
+$exclude_remote_ports = array_map('intval', $server_cfg['exclude_remote_ports'] ?? []);
+$include_only_ips     = $server_cfg['include_only_ips']     ?? [];
+$skip_loopback        = !empty($server_cfg['skip_loopback']);
+$skip_ipv6            = !empty($server_cfg['skip_ipv6']);
+$ephemeral_threshold  = (int)($server_cfg['ephemeral_port_threshold'] ?? 0);
+$established_only     = !empty($server_cfg['established_only']);
+
+$is_loopback = static function (string $ip): bool {
+    if ($ip === '' || $ip === '0.0.0.0' || $ip === '::') return false;
+    if (str_starts_with($ip, '127.')) return true;
+    if ($ip === '::1') return true;
+    return false;
+};
+$is_ipv6 = static fn(string $ip): bool => str_contains($ip, ':');
+
+$filtered = [];
+$skipped  = ['process' => 0, 'remote_ip' => 0, 'remote_port' => 0, 'include_only' => 0, 'loopback' => 0, 'ipv6' => 0, 'ephemeral' => 0, 'state' => 0];
+foreach ($connections as $c) {
+    if (!is_array($c)) continue;
+    $proc  = strtolower((string)($c['process_name'] ?? ''));
+    $raddr = (string)($c['remote_addr'] ?? '');
+    $laddr = (string)($c['local_addr']  ?? '');
+    $rport = (int)   ($c['remote_port'] ?? 0);
+    $state = strtoupper((string)($c['state'] ?? ''));
+
+    if (in_array($proc, $exclude_processes, true))                    { $skipped['process']++;     continue; }
+    if (in_array($raddr, $exclude_remote_ips, true))                  { $skipped['remote_ip']++;   continue; }
+    if (in_array($rport, $exclude_remote_ports, true))                { $skipped['remote_port']++; continue; }
+    if (!empty($include_only_ips) && !in_array($raddr, $include_only_ips, true)) { $skipped['include_only']++; continue; }
+    if ($skip_loopback && ($is_loopback($raddr) || $is_loopback($laddr))) { $skipped['loopback']++; continue; }
+    if ($skip_ipv6 && ($is_ipv6($raddr) || $is_ipv6($laddr)))          { $skipped['ipv6']++;        continue; }
+    if ($ephemeral_threshold > 0 && $rport >= $ephemeral_threshold)   { $skipped['ephemeral']++;   continue; }
+    if ($established_only && $state !== '' && !in_array($state, ['ESTABLISHED', 'CLOSE_WAIT', 'TIME_WAIT'], true)) {
+        $skipped['state']++; continue;
+    }
+
+    $filtered[] = $c;
+}
+$connections = $filtered;
+
 // ── Persist connections ──────────────────────────────────────────────────
 // Lifecycle pattern (from PluginNetstatconnectionsConnection::handleInventory):
 //   1. Mark all existing rows for this computer as 'closed' with current ts as last_seen
@@ -200,5 +251,6 @@ reply(200, [
     'hostname'          => $hostname,
     'computers_id'      => $computers_id,
     'connections_count' => $count,
+    'skipped'           => $skipped,
     'collection_method' => $method,
 ]);
