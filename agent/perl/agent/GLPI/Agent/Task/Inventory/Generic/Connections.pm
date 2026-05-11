@@ -115,11 +115,17 @@ sub _push {
             if $logger;
         return 0;
     }
-    # Normalize URL — agents may point at glpiinventory plugin paths or legacy
-    # endpoints. Strip trailing path components down to the GLPI root, since
-    # our plugin lives at /plugins/netstatconnections/.
-    $glpi_url =~ s{/+$}{};
-    $glpi_url =~ s{/front/inventory\.php$}{}i;
+    # Normalize URL — agents may point at glpiinventory plugin paths, fusioninventory,
+    # legacy /front/inventory.php endpoints, etc. Strip everything down to the GLPI
+    # root since our plugin lives at /plugins/netstatconnections/.
+    $glpi_url =~ s{/+$}{};                                         # trailing slashes
+    $glpi_url =~ s{/front/inventory\.php$}{}i;                     # legacy core
+    $glpi_url =~ s{/marketplace/glpiinventory/?$}{}i;              # marketplace glpiinventory
+    $glpi_url =~ s{/plugins/glpiinventory/?$}{}i;                  # plugins glpiinventory
+    $glpi_url =~ s{/plugins/fusioninventory(/.*)?$}{}i;            # legacy fusioninventory + subpaths
+    $glpi_url =~ s{/marketplace/fusioninventory(/.*)?$}{}i;        # marketplace fusion
+    $glpi_url =~ s{/front/communication\.php$}{}i;                 # fusion legacy endpoint
+    $glpi_url =~ s{/+$}{};                                         # any trailing slashes left after stripping
     $glpi_url =~ s{/marketplace/[^/]+/?$}{}i;
     $glpi_url =~ s{/plugins/[^/]+/?$}{}i;
     $glpi_url =~ s{/marketplace/[^/]+/.*$}{}i;
