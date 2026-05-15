@@ -118,7 +118,7 @@ sub _push {
     # Normalize URL — agents may point at glpiinventory plugin paths, fusioninventory,
     # legacy /front/inventory.php endpoints, etc. Strip everything down to the GLPI
     # root since our plugin lives at /plugins/netstatconnections/. Canonical form
-    # ends with exactly one trailing slash (e.g. "https://glpi.example.com/glpi/").
+    # has NO trailing slash (e.g. "https://glpi.example.com/glpi").
     $glpi_url =~ s{/+$}{};                                         # collapse trailing slashes
     $glpi_url =~ s{/front/inventory\.php$}{}i;                     # legacy core
     $glpi_url =~ s{/marketplace/glpiinventory/?$}{}i;              # marketplace glpiinventory
@@ -127,16 +127,16 @@ sub _push {
     $glpi_url =~ s{/marketplace/fusioninventory(/.*)?$}{}i;        # marketplace fusion
     $glpi_url =~ s{/front/communication\.php$}{}i;                 # fusion legacy endpoint
     $glpi_url =~ s{/+$}{};                                         # re-collapse
-    $glpi_url .= '/';                                              # canonical trailing slash
+    # Catch-all: strip any remaining /marketplace/<plugin> or /plugins/<plugin> paths
     $glpi_url =~ s{/marketplace/[^/]+/?$}{}i;
     $glpi_url =~ s{/plugins/[^/]+/?$}{}i;
     $glpi_url =~ s{/marketplace/[^/]+/.*$}{}i;
     $glpi_url =~ s{/plugins/[^/]+/.*$}{}i;
-    $glpi_url =~ s{/+$}{};
+    $glpi_url =~ s{/+$}{};                                         # final collapse
     $logger->debug("Connections module: normalized GLPI base URL: $glpi_url") if $logger;
 
-    my $config_url = "${glpi_url}plugins/netstatconnections/front/agentconfig.php";
-    my $push_url   = "${glpi_url}plugins/netstatconnections/front/push.php";
+    my $config_url = "$glpi_url/plugins/netstatconnections/front/agentconfig.php";
+    my $push_url   = "$glpi_url/plugins/netstatconnections/front/push.php";
 
     # Fetch the push token from agentconfig.php
     my $ua = LWP::UserAgent->new(

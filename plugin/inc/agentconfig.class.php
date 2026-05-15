@@ -79,11 +79,8 @@ class PluginNetstatconnectionsAgentconfig {
      */
     public static function getToken(): string {
         global $DB;
-        error_log('[netstatconnections] getToken: $DB type=' . (is_object($DB) ? get_class($DB) : gettype($DB))
-            . ' connected=' . (is_object($DB) && method_exists($DB, 'connected') ? var_export($DB->connected(), true) : 'n/a'));
 
         if (!$DB || !$DB->tableExists('glpi_plugin_netstatconnections_config')) {
-            error_log('[netstatconnections] getToken: DB or table missing');
             return '';
         }
         $row = $DB->request([
@@ -92,8 +89,6 @@ class PluginNetstatconnectionsAgentconfig {
             'WHERE'  => ['key' => self::TOKEN_KEY],
             'LIMIT'  => 1,
         ])->current();
-
-        error_log('[netstatconnections] getToken: row=' . var_export($row, true));
 
         if ($row && !empty($row['value'])) {
             return (string)$row['value'];
