@@ -129,8 +129,20 @@ if ($computers_id <= 0) {
     ]);
 }
 
-$method      = (string)($body['collection_method'] ?? 'netstat');
-$collected   = (string)($body['collected_at']      ?? date('Y-m-d H:i:s'));
+$method = (string)($body['collection_method'] ?? 'netstat');
+
+// $collected must be a valid datetime — ?? only catches null, so an empty
+// string from the agent would have silently propagated to collected_at and
+// last_seen, planting '0000-00-00 00:00:00' in the DB on every push.
+$collected_raw = (string)($body['collected_at'] ?? '');
+if ($collected_raw !== ''
+    && preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/', $collected_raw)
+    && !str_starts_with($collected_raw, '0000-')) {
+    $collected = $collected_raw;
+} else {
+    $collected = date('Y-m-d H:i:s');
+}
+
 $connections = is_array($body['connections'] ?? null) ? $body['connections'] : [];
 
 // ── Apply server-side filters (from agent_collection config) ─────────────
@@ -246,6 +258,25 @@ try {
             (string)($c['applied_setting'] ?? ''),
         ]);
         $count++;
+    }
+
+    // Bump last_seen on locked rows that match connections still reported by the
+    // agent — proves the connection is still alive even though we don't replace it.
+    $upd_locked = $pdo->prepare("UPDATE glpi_plugin_netstatconnections_connections
+        SET last_seen = ?, connection_status = 'active'
+        WHERE computers_id = ? AND is_locked = 1
+          AND protocol = ? AND remote_addr = ? AND remote_port = ? AND process_name = ?");
+
+    foreach ($connections as $c) {
+        if (!is_array($c)) continue;
+        $upd_locked->execute([
+            $collected,
+            $computers_id,
+            (string)($c['protocol']     ?? 'TCP'),
+            (string)($c['remote_addr']  ?? ''),
+            (int)   ($c['remote_port']  ?? 0),
+            (string)($c['process_name'] ?? ''),
+        ]);
     }
 
     $pdo->commit();

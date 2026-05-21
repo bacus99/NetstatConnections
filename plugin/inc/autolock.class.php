@@ -2,11 +2,14 @@
 /**
  * PluginNetstatconnectionsAutolock
  *
- * v1.2.0 — Proper inbound detection:
+ * v1.3.0 — Cluster-aware impact routing:
  *   - Outbound: remote_port matches a policy → direction from policy
  *   - Inbound:  local_port matches a policy AND conn_direction='inbound' → direction = 'depends'
  *   - Inline resolver if remote_scope is empty
  *   - Creates impact relations on lock
+ *   - When DBI is on a Cluster (AlwaysOn / FCI), the Source ↔ DBI direct edge
+ *     is replaced by Source ↔ Cluster + Cluster → DBI (host), giving a clean
+ *     linear path through the cluster listener.
  */
 class PluginNetstatconnectionsAutolock {
 
@@ -238,23 +241,58 @@ class PluginNetstatconnectionsAutolock {
                 }
             }
 
+            // ── Pillar 3.5: Cluster routing ───────────────────────────────
+            // When the DBI lives on a Cluster (AlwaysOn / FCI), the client
+            // doesn't connect to the DBI directly — it connects to the
+            // cluster's listener. The impact path is therefore:
+            //
+            //     Source -(MSSQL 1433)-> Cluster -(host)-> DBI
+            //
+            // not a confusing direct Source -> DBI edge that bypasses the
+            // Cluster. We swap the client-facing target to the Cluster and
+            // keep Pillar 3's Cluster -> DBI host edge below.
+            $is_clustered_db = ($impact_target_type === 'DatabaseInstance'
+                && $chain_host_type === 'Cluster'
+                && $chain_host_id > 0);
+
+            if ($is_clustered_db) {
+                $client_edge_type = 'Cluster';
+                $client_edge_id   = $chain_host_id;
+            } else {
+                $client_edge_type = $impact_target_type;
+                $client_edge_id   = $impact_target_id;
+            }
+
             if ($direction === 'impacts') {
                 // Remote impacts us (if remote goes down, we break)
-                $src_type = $impact_target_type; $src_id = $impact_target_id;
-                $dst_type = 'Computer';          $dst_id = $computers_id;
+                $src_type = $client_edge_type; $src_id = $client_edge_id;
+                $dst_type = 'Computer';        $dst_id = $computers_id;
             } else {
                 // We impact them (they depend on us)
-                $src_type = 'Computer';          $src_id = $computers_id;
-                $dst_type = $impact_target_type; $dst_id = $impact_target_id;
+                $src_type = 'Computer';        $src_id = $computers_id;
+                $dst_type = $client_edge_type; $dst_id = $client_edge_id;
             }
 
             // Build accumulated name from ALL currently-locked connections to this CI.
-            // Only remove the wrong-direction relation — never wipe the forward one,
-            // as it would erase previously accumulated port labels.
-            $accumulated_label = self::buildImpactName($computers_id, $impact_target_type, $impact_target_id);
+            // For clustered DBs, aggregate labels across every DBI hosted on the cluster
+            // so the single Source<->Cluster edge shows every service the cluster offers
+            // to this computer (e.g. "MSSQL 1433, AlwaysOn 5022").
+            if ($is_clustered_db) {
+                $accumulated_label = self::buildClusterImpactName($computers_id, $client_edge_id);
+            } else {
+                $accumulated_label = self::buildImpactName($computers_id, $impact_target_type, $impact_target_id);
+            }
             if ($accumulated_label === '') $accumulated_label = $label;
 
             self::removeImpactRelation($dst_type, $dst_id, $src_type, $src_id);   // wrong direction only
+
+            // For clustered DBs, also clean up the legacy direct DBI<->Source edge
+            // created by previous versions of this plugin so the graph collapses
+            // to the single Source -> Cluster -> DBI path going forward.
+            if ($is_clustered_db) {
+                self::removeImpactRelation('DatabaseInstance', $impact_target_id, 'Computer', $computers_id);
+                self::removeImpactRelation('Computer', $computers_id, 'DatabaseInstance', $impact_target_id);
+            }
 
             self::ensureImpactItem($src_type, $src_id);
             self::ensureImpactItem($dst_type, $dst_id);
@@ -328,6 +366,42 @@ class PluginNetstatconnectionsAutolock {
         $labels = [];
         foreach ($rows as $r) {
             $label = self::getPortLabel((int)($r['service_port'] ?? 0), $r['protocol'] ?? 'TCP');
+            if ($label !== '' && !in_array($label, $labels, true)) {
+                $labels[] = $label;
+            }
+        }
+        sort($labels);
+        return implode(', ', $labels);
+    }
+
+    /**
+     * Aggregate port labels across every locked connection from $computers_id
+     * to ANY DatabaseInstance hosted on the given Cluster. Used to label the
+     * single Source ↔ Cluster edge in the AlwaysOn / FCI routing case.
+     *
+     * Returns e.g. "AlwaysOn 5022, MSSQL 1433" for a node that connects to a
+     * clustered SQL server's primary + AG endpoints.
+     */
+    private static function buildClusterImpactName(int $computers_id, int $cluster_id): string {
+        global $DB;
+        if ($computers_id <= 0 || $cluster_id <= 0) return '';
+        if (!$DB->tableExists('glpi_databaseinstances')) return '';
+
+        $sql = "SELECT DISTINCT c.`service_port`, c.`protocol`
+                FROM `glpi_plugin_netstatconnections_connections` AS c
+                INNER JOIN `glpi_databaseinstances` AS d
+                    ON c.`remote_items_id` = d.`id`
+                WHERE c.`computers_id`    = " . (int)$computers_id . "
+                  AND c.`is_locked`       = 1
+                  AND c.`remote_itemtype` = 'DatabaseInstance'
+                  AND d.`itemtype`        = 'Cluster'
+                  AND d.`items_id`        = " . (int)$cluster_id . "
+                  AND d.`is_deleted`      = 0";
+
+        $result = $DB->doQuery($sql);
+        $labels = [];
+        while ($row = $DB->fetchAssoc($result)) {
+            $label = self::getPortLabel((int)($row['service_port'] ?? 0), $row['protocol'] ?? 'TCP');
             if ($label !== '' && !in_array($label, $labels, true)) {
                 $labels[] = $label;
             }

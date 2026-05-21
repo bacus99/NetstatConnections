@@ -26,7 +26,7 @@ use Getopt::Long;
 use Socket       qw(inet_aton AF_INET);
 use JSON::PP;
 
-our $VERSION = '2.1.0';
+our $VERSION = '2.2.0';
 
 # ---------------------------------------------------------------------------
 # Options

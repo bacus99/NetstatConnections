@@ -195,6 +195,68 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
 
     // ── Display ─────────────────────────────────────────────────────
 
+    /** @var bool Self-heal datetime cleanup has run this PHP request */
+    private static bool $datetime_scrubbed = false;
+
+    /**
+     * Self-heal invalid datetime values across all timestamp columns.
+     * Rows inserted by pre-2.2.0 versions of the plugin (or under non-strict
+     * MySQL mode) may carry '0000-00-00 00:00:00' or '' in created_at /
+     * collected_at / last_seen / resolved_at. Under current strict mode those
+     * values trigger "Incorrect datetime value: ''" warnings on every SELECT
+     * that aggregates the column (e.g. MAX(created_at) in this tab's UNION
+     * query).
+     *
+     * Uses the `col + 0 = 0` arithmetic trick to identify zero-dates without
+     * triggering the strict-mode comparison warning itself. Runs at most once
+     * per PHP request via a static flag.
+     */
+    private static function selfHealDatetimes(): void {
+        if (self::$datetime_scrubbed) return;
+        self::$datetime_scrubbed = true;
+
+        global $DB;
+        $table = 'glpi_plugin_netstatconnections_connections';
+
+        // Temporarily clear strict mode so literal '=' comparisons against
+        // zero-dates and '' don't re-fire the very warning we're trying to
+        // clean up. Saved/restored so the rest of the request is unaffected.
+        $saved_mode = null;
+        try {
+            $res = $DB->doQuery("SELECT @@SESSION.sql_mode AS m");
+            if ($res) {
+                $row = $DB->fetchAssoc($res);
+                $saved_mode = $row['m'] ?? null;
+            }
+            $DB->doQuery("SET SESSION sql_mode = ''");
+        } catch (\Throwable $e) { /* fall through — best effort */ }
+
+        foreach (['created_at', 'collected_at', 'last_seen', 'resolved_at'] as $col) {
+            if (!$DB->fieldExists($table, $col)) continue;
+            try {
+                $DB->doQuery(
+                    "UPDATE `{$table}` SET `{$col}` = NULL "
+                    . "WHERE `{$col}` = '0000-00-00 00:00:00' OR `{$col}` = ''"
+                );
+            } catch (\Throwable $e) { /* ignore — never block the page render */ }
+            // Belt-and-suspenders: arithmetic catch for anything the literal
+            // compare missed (different zero forms, partial dates, etc.)
+            try {
+                $DB->doQuery(
+                    "UPDATE `{$table}` SET `{$col}` = NULL "
+                    . "WHERE `{$col}` IS NOT NULL AND (`{$col}` + 0) = 0"
+                );
+            } catch (\Throwable $e) { /* ignore */ }
+        }
+
+        // Restore previous sql_mode
+        if ($saved_mode !== null) {
+            try {
+                $DB->doQuery("SET SESSION sql_mode = " . $DB->quote($saved_mode));
+            } catch (\Throwable $e) { /* ignore */ }
+        }
+    }
+
     public static function showForComputer(Computer $computer): void {
         global $DB;
 
@@ -203,11 +265,19 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
             return;
         }
 
+        // One-time-per-request scrub of invalid datetime values so the MAX()
+        // aggregates below don't emit "Incorrect datetime value" warnings.
+        self::selfHealDatetimes();
+
         $computers_id = (int) $computer->getID();
 
         // Last collection timestamp
         $last = $DB->request([
-            'SELECT' => new \Glpi\DBAL\QueryExpression('MAX(`collected_at`) AS `last_collected`'),
+            // Defensive MAX: arithmetic coercion filters out '0000-00-00 00:00:00'
+            // and '' so strict mode doesn't emit "Incorrect datetime value" warnings.
+            'SELECT' => new \Glpi\DBAL\QueryExpression(
+                'MAX(IF(IFNULL(`collected_at` + 0, 0) > 0, `collected_at`, NULL)) AS `last_collected`'
+            ),
             'FROM'   => 'glpi_plugin_netstatconnections_connections',
             'WHERE'  => ['computers_id' => $computers_id],
         ])->current();
@@ -244,7 +314,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     MAX(remote_items_id) AS remote_items_id,
                     MAX(remote_itemtype) AS remote_itemtype,
                     MAX(remote_scope) AS remote_scope,
-                    MAX(created_at) AS created_at,
+                    MAX(IF(IFNULL(created_at + 0, 0) > 0, created_at, NULL)) AS created_at,
                     COUNT(*) AS conn_count,
                     'out' AS direction
                 FROM `{$table}`
@@ -270,7 +340,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     MAX(remote_items_id) AS remote_items_id,
                     MAX(remote_itemtype) AS remote_itemtype,
                     MAX(remote_scope) AS remote_scope,
-                    MAX(created_at) AS created_at,
+                    MAX(IF(IFNULL(created_at + 0, 0) > 0, created_at, NULL)) AS created_at,
                     COUNT(*) AS conn_count,
                     'in' AS direction
                 FROM `{$table}`
@@ -297,7 +367,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     MAX(remote_items_id) AS remote_items_id,
                     MAX(remote_itemtype) AS remote_itemtype,
                     MAX(remote_scope) AS remote_scope,
-                    MAX(created_at) AS created_at,
+                    MAX(IF(IFNULL(created_at + 0, 0) > 0, created_at, NULL)) AS created_at,
                     COUNT(*) AS conn_count,
                     'out' AS direction
                 FROM `{$table}`
@@ -332,7 +402,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     MAX(remote_items_id) AS remote_items_id,
                     MAX(remote_itemtype) AS remote_itemtype,
                     MAX(remote_scope) AS remote_scope,
-                    MAX(created_at) AS created_at,
+                    MAX(IF(IFNULL(created_at + 0, 0) > 0, created_at, NULL)) AS created_at,
                     COUNT(*) AS conn_count,
                     CASE
                         WHEN remote_port >= {$ephemeral} THEN 'in'

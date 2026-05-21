@@ -168,6 +168,58 @@ function plugin_netstatconnections_install(): bool {
         }
     }
 
+    // Unconditional cleanup: scrub invalid datetime values across ALL timestamp columns
+    // on ALL plugin tables. Rows inserted under non-strict MySQL mode (or by pre-2.2.0
+    // versions of this plugin) may have '' or '0000-00-00 00:00:00' baked in. Under
+    // current strict mode those values trigger "Incorrect datetime value" warnings on
+    // every SELECT that touches the column.
+    //
+    // Strategy: temporarily clear sql_mode for this session so literal comparisons
+    // against zero-dates and '' don't re-fire the warning we're trying to clean up.
+    // Without this, even the cleanup UPDATE would emit the warning when evaluating
+    // the WHERE clause against bad rows. Restored after cleanup completes.
+    //
+    // Idempotent: running this on a clean DB is a no-op.
+    $saved_mode = null;
+    try {
+        $res = $DB->doQuery("SELECT @@SESSION.sql_mode AS m");
+        if ($res) {
+            $row = $DB->fetchAssoc($res);
+            $saved_mode = $row['m'] ?? null;
+        }
+        $DB->doQuery("SET SESSION sql_mode = ''");
+    } catch (\Throwable $e) { /* best effort */ }
+
+    $tables_timestamp_cols = [
+        'glpi_plugin_netstatconnections_connections'   => ['created_at', 'collected_at', 'last_seen', 'resolved_at'],
+        'glpi_plugin_netstatconnections_ports'         => ['date_creation', 'date_mod'],
+        'glpi_plugin_netstatconnections_relationtypes' => ['date_creation', 'date_mod'],
+    ];
+    foreach ($tables_timestamp_cols as $tbl => $cols) {
+        if (!$DB->tableExists($tbl)) continue;
+        foreach ($cols as $col) {
+            if (!$DB->fieldExists($tbl, $col)) continue;
+            // Literal cleanup — works because sql_mode is cleared above
+            try {
+                $DB->doQuery("UPDATE `{$tbl}` SET `{$col}` = NULL "
+                    . "WHERE `{$col}` = '0000-00-00 00:00:00' OR `{$col}` = ''");
+            } catch (\Throwable $e) { /* ignore */ }
+            // Arithmetic belt-and-suspenders for anything else
+            try {
+                $DB->doQuery("UPDATE `{$tbl}` SET `{$col}` = NULL "
+                    . "WHERE `{$col}` IS NOT NULL AND (`{$col}` + 0) = 0");
+            } catch (\Throwable $e) { /* ignore */ }
+        }
+    }
+
+    // Restore previous sql_mode
+    if ($saved_mode !== null) {
+        try {
+            $quoted = "'" . str_replace("'", "''", $saved_mode) . "'";
+            $DB->doQuery("SET SESSION sql_mode = {$quoted}");
+        } catch (\Throwable $e) { /* ignore */ }
+    }
+
     // Make impact_direction nullable (unlock writes NULL, not '')
     if ($DB->fieldExists($table, 'impact_direction')) {
         $res      = $DB->doQuery("SHOW COLUMNS FROM `{$table}` WHERE Field = 'impact_direction'");

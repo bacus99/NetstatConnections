@@ -1,7 +1,24 @@
 <?php
 /**
- * Plugin: netstatconnections v2.1.0
+ * Plugin: netstatconnections v2.2.0
  * Network Connections — GLPI native inventory enhancement
+ *
+ * v2.2.0 — Lifecycle + enrichment + cluster-aware impact routing
+ *   - New cron NetstatLifecycle: transitions active→closed for stale rows
+ *     (default 72h, ≥3× agent push cycle) and sweeps stale agents (7+ days
+ *     silent).
+ *   - New cron NetstatEnrich: soft-populates service_port / conn_direction /
+ *     impact_direction on unlocked rows from port definitions so the
+ *     dependency map fills in without manual locking.
+ *   - Cluster-aware impact routing: when a DBI is hosted on a Cluster, the
+ *     client edge now goes Source → Cluster → DBI instead of bypassing the
+ *     Cluster (matches AlwaysOn / FCI listener topology).
+ *   - push.php now bumps last_seen on still-reported locked rows, preventing
+ *     them from being closed by the lifecycle cron.
+ *   - Agent: fixed URL normalization bug producing /glpiplugins/ instead of
+ *     /glpi/plugins/ for agents pointed at marketplace paths.
+ *   - Agent: hardened MSSQL.pm against Always On secondary replicas (no more
+ *     "uninitialized value" warnings for unavailable databases).
  *
  * v2.1.0 — Push endpoint architecture (reverted from PRE_INVENTORY hook)
  *   - GLPI 11.0.6 stateless inventory route loads plugins AFTER doHook(PRE_INVENTORY)
@@ -14,7 +31,7 @@
  *     are auto-fetched by agents.
  */
 
-define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.1.0');
+define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.2.0');
 define('PLUGIN_NETSTATCONNECTIONS_MIN_GLPI', '11.0.0');
 define('PLUGIN_NETSTATCONNECTIONS_MAX_GLPI', '12.0.0');
 

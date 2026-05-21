@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.2.0] — 2026-05-15
+
+### Plugin
+- **New cron `NetstatLifecycle`** (hourly): transitions active→closed for rows whose `last_seen` is older than `param` hours. Default 72h = 3× the standard 24h agent push cycle, sized to absorb jitter without flapping. Pass 2 sweeps stale agents (no push in 7+ days) and bulk-closes their remaining active rows.
+- **New cron `NetstatEnrich`** (hourly): soft-populates `service_port`, `conn_direction`, `impact_direction` on unlocked active rows from port definitions. Never overwrites existing values. Drives dependency-map fill-in without manual locking.
+- **`autolock.class.php` v1.3.0 — Cluster-aware impact routing**: when a `DatabaseInstance` is hosted on a `Cluster` (AlwaysOn / FCI), the client edge now routes `Source → Cluster → DBI` instead of bypassing the Cluster. Legacy direct `Source ↔ DBI` edges from previous versions are removed on next lock to migrate the graph cleanly. Multi-port aggregation (`MSSQL 1433, AlwaysOn 5022`) on the cluster edge.
+- **`push.php`**: now bumps `last_seen` + flips `connection_status='active'` on still-reported locked rows, preventing the lifecycle cron from closing them.
+- **`agentconfig.class.php`**: removed 3 diagnostic `error_log` calls left from debugging.
+
+### Agent
+- **`Connections.pm`**: fixed URL normalization producing `https://host/glpiplugins/...` instead of `https://host/glpi/plugins/...` (trailing-slash regex strip was running after canonical slash was added).
+- **`MSSQL.pm`**: hardened against Always On secondary replicas — `sp_spaceused` and `sys.objects` queries returning `undef` no longer trigger "uninitialized value in pattern match" / "int(undef)" warnings on cluster nodes.
+- **User-Agent bump** to `GLPI-Agent-NetstatConnections/2.2.0`.
+
 ## [1.3.0] — 2026-04-26
 
 ### Plugin — Pillar 1: Connection Lifecycle

@@ -143,7 +143,7 @@ sub _push {
         timeout => 30,
         ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0x00 },
     );
-    $ua->agent("GLPI-Agent-NetstatConnections/2.1.0");
+    $ua->agent("GLPI-Agent-NetstatConnections/2.2.0");
 
     my $cfg_resp = $ua->get($config_url);
     unless ($cfg_resp->is_success) {
