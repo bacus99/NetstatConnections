@@ -2,12 +2,17 @@
 /**
  * lock.php — AJAX endpoint for lock/unlock + impact direction toggle
  *
+ * v1.3.3 — GLPI 11.0.7 compatibility:
+ *   - Resolves symlinks (public/plugins → ../plugins) before include path math
+ *     so we always reach <glpi_root>/inc/includes.php no matter how Apache
+ *     routes the URL.
+ *
  * v1.3.2 — Per-port locking:
  *   - WHERE scoped to computers_id + remote_addr + service port (not whole IP)
  *   - Unlock only removes impact relation when NO other locked ports remain to same remote CI
  */
 
-include('../../../inc/includes.php');
+require_once __DIR__ . '/../inc/_bootstrap.php';
 
 header('Content-Type: application/json');
 

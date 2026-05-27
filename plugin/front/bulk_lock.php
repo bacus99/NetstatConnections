@@ -20,7 +20,7 @@
  * Returns JSON: { success, locked, count_processed, count_skipped, port }
  */
 
-include('../../../inc/includes.php');
+require_once __DIR__ . '/../inc/_bootstrap.php';
 
 header('Content-Type: application/json');
 

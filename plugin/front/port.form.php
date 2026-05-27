@@ -1,5 +1,5 @@
 <?php
-include('../../../inc/includes.php');
+require_once __DIR__ . '/../inc/_bootstrap.php';
 
 Session::checkRight('dropdown', UPDATE);
 

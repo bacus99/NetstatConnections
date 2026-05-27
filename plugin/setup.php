@@ -31,7 +31,7 @@
  *     are auto-fetched by agents.
  */
 
-define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.2.0');
+define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.2.2');
 define('PLUGIN_NETSTATCONNECTIONS_MIN_GLPI', '11.0.0');
 define('PLUGIN_NETSTATCONNECTIONS_MAX_GLPI', '12.0.0');
 
@@ -73,8 +73,39 @@ function plugin_init_netstatconnections(): void {
         'PluginNetstatconnectionsPort'
     ];
 
-    // Firewall bypasses for unauthenticated agent endpoints.
-    // GLPI 11 Symfony router intercepts all requests including static files.
+    // Routing bypasses for unauthenticated agent endpoints.
+    //
+    // GLPI 11.0.7+ split request gating into TWO independent listeners:
+    //
+    //   1. FirewallStrategyListener (authentication)  — consults Firewall::STRATEGY_*
+    //      AND SessionManager::isResourceStateless()
+    //   2. CheckCsrfListener (CSRF protection)        — consults ONLY
+    //      SessionManager::isResourceStateless()
+    //
+    // Before 11.0.7, STRATEGY_NO_CHECK skipped both auth AND CSRF — but in 11.0.7
+    // the new CheckCsrfListener no longer consults the Firewall strategy, so POST
+    // requests from agents (which have no GLPI session and therefore no CSRF token)
+    // get rejected. The endpoints must ALSO be registered as stateless via
+    // SessionManager so both listeners short-circuit.
+    //
+    // Safe for our endpoints because:
+    //   - push.php uses raw PDO (no $DB / no GLPI session needed)
+    //   - agentconfig.php is a simple GET that bootstraps GLPI normally
+    //   - vis-asset.php just serves static JS/CSS via PHP passthrough
+    if (class_exists('\Glpi\Http\SessionManager')) {
+        // ONLY push.php needs stateless registration. agentconfig.php and
+        // vis-asset.php are GET-only and CheckCsrfListener already skips
+        // CSRF for bodyless methods (GET / HEAD / OPTIONS / TRACE).
+        //
+        // Registering them as stateless would prevent GLPI from loading the
+        // plugin's autoloader and $DB connection for those requests,
+        // breaking PluginNetstatconnectionsAgentconfig::get() with a "class
+        // not found" fatal error.
+        \Glpi\Http\SessionManager::registerPluginStatelessPath(
+            'netstatconnections', '#^/front/push\.php#'
+        );
+    }
+
     if (class_exists('\Glpi\Http\Firewall')) {
         // vis-network JS/CSS served through PHP passthrough (public MIT library)
         \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts(
@@ -97,9 +128,12 @@ function plugin_init_netstatconnections(): void {
         );
     }
 
-    // SessionManager stateless registration removed: agentconfig.php works
-    // fine without it, and adding it caused $DB to be null in push.php for
-    // POST requests. STRATEGY_NO_CHECK alone is sufficient.
+    // Historical note: in v2.1.x we removed SessionManager stateless registration
+    // because it caused $DB to be null in push.php under GLPI 11.0.6. That side
+    // effect no longer matters because push.php now uses raw PDO and bootstraps
+    // its own DB connection from /etc/glpi11/config_db.php — fully independent of
+    // GLPI's session/$DB state. Registration is now mandatory in 11.0.7+ for CSRF
+    // bypass, so we put it back above.
 }
 
 function plugin_version_netstatconnections(): array {

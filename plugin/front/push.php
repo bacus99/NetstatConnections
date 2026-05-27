@@ -131,17 +131,37 @@ if ($computers_id <= 0) {
 
 $method = (string)($body['collection_method'] ?? 'netstat');
 
-// $collected must be a valid datetime — ?? only catches null, so an empty
-// string from the agent would have silently propagated to collected_at and
-// last_seen, planting '0000-00-00 00:00:00' in the DB on every push.
-$collected_raw = (string)($body['collected_at'] ?? '');
-if ($collected_raw !== ''
-    && preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/', $collected_raw)
-    && !str_starts_with($collected_raw, '0000-')) {
-    $collected = $collected_raw;
-} else {
-    $collected = date('Y-m-d H:i:s');
+/**
+ * Normalize any reasonable datetime string the agent sends into MySQL's
+ * canonical 'Y-m-d H:i:s' format. Returns null for invalid / empty input
+ * so callers can decide on a fallback.
+ *
+ * Handles:
+ *   - 'YYYY-MM-DD HH:MM:SS'           (already canonical)
+ *   - 'YYYY-MM-DD H:MM:SS AM/PM'      (PowerShell Get-Date default in en-US)
+ *   - 'M/D/YYYY H:MM:SS AM/PM'        (other PowerShell culture variations)
+ *   - ISO-8601 'YYYY-MM-DDTHH:MM:SS'
+ *
+ * Rejects:
+ *   - empty string
+ *   - '0000-00-00 00:00:00' (zero-date, invalid for MySQL TIMESTAMP)
+ *   - anything strtotime() can't parse
+ */
+function normalize_datetime(?string $val): ?string {
+    if ($val === null) return null;
+    $val = trim($val);
+    if ($val === '') return null;
+    if (str_starts_with($val, '0000-')) return null;
+
+    $ts = strtotime($val);
+    if ($ts === false || $ts <= 0) return null;
+
+    return date('Y-m-d H:i:s', $ts);
 }
+
+// $collected must be a valid datetime — fall back to NOW() if absent or invalid.
+$collected = normalize_datetime((string)($body['collected_at'] ?? ''))
+          ?? date('Y-m-d H:i:s');
 
 $connections = is_array($body['connections'] ?? null) ? $body['connections'] : [];
 
@@ -231,12 +251,15 @@ try {
     $count = 0;
     foreach ($connections as $c) {
         if (!is_array($c)) continue;
-        // Validate created_at to avoid '0000-00-00' warnings
-        $created_at = null;
-        if (!empty($c['created_at']) && preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/', (string)$c['created_at'])
-            && !str_starts_with((string)$c['created_at'], '0000-')) {
-            $created_at = (string)$c['created_at'];
-        }
+        // Always write a VALID TIMESTAMP for created_at — never NULL, never zero-date.
+        // MySQL TIMESTAMP's valid range is 1970-01-01 00:00:01 .. 2038-01-19 03:14:07,
+        // so any value outside that range is type-invalid. Fall back through the chain:
+        //   1. Agent-supplied $c['created_at']  (parsed via normalize_datetime so
+        //      "2026-05-10 10:02:05 AM" / ISO / etc. all become canonical 'Y-m-d H:i:s')
+        //   2. $collected (the push's collected_at — already normalized above)
+        //   3. NOW() — pre-validated by push.php so always within range
+        $created_at = normalize_datetime((string)($c['created_at'] ?? ''))
+                   ?? $collected;
         $ins->execute([
             $computers_id,
             (string)($c['protocol']        ?? 'TCP'),

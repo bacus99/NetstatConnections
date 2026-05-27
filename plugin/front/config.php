@@ -4,7 +4,7 @@
  * Allows configuring the global collection filters that agents
  * fetch from the agentconfig.php endpoint.
  */
-include('../../../inc/includes.php');
+require_once __DIR__ . '/../inc/_bootstrap.php';
 Session::checkRight('config', READ);
 
 Html::header(

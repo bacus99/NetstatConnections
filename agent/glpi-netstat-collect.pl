@@ -26,7 +26,7 @@ use Getopt::Long;
 use Socket       qw(inet_aton AF_INET);
 use JSON::PP;
 
-our $VERSION = '2.2.0';
+our $VERSION = '2.2.2';
 
 # ---------------------------------------------------------------------------
 # Options
@@ -461,10 +461,17 @@ exit 0;
 
 sub _collectConnectionsWindows_PS {
     # ── TCP via Get-NetTCPConnection ──────────────────────────────────
+    # CreationTime is projected through ToString('yyyy-MM-dd HH:mm:ss') so the
+    # CSV output is locale-independent. Default PowerShell ToString() uses the
+    # system culture, which on en-US produces "2026-05-10 10:02:05 AM" — that
+    # 12-hour-with-meridiem format isn't valid MySQL TIMESTAMP input and was
+    # forcing push.php to do server-side reparsing per row.
     my $ps_tcp = q{powershell -NoProfile -NonInteractive -Command }
         . q{"Get-NetTCPConnection }
         . q{| Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,}
-        . q{State,OwningProcess,CreationTime,OffloadState,AppliedSetting }
+        . q{State,OwningProcess,}
+        . q{@{Name='CreationTime';Expression={if ($_.CreationTime) {$_.CreationTime.ToString('yyyy-MM-dd HH:mm:ss')} else {''}}},}
+        . q{OffloadState,AppliedSetting }
         . q{| ConvertTo-Csv -NoTypeInformation"};
 
     my @tcp_lines = _cmd($ps_tcp);
@@ -504,9 +511,11 @@ sub _collectConnectionsWindows_PS {
     }
 
     # ── UDP via Get-NetUDPEndpoint ────────────────────────────────────
+    # Same ISO normalization as TCP above.
     my $ps_udp = q{powershell -NoProfile -NonInteractive -Command }
         . q{"Get-NetUDPEndpoint }
-        . q{| Select-Object LocalAddress,LocalPort,OwningProcess,CreationTime }
+        . q{| Select-Object LocalAddress,LocalPort,OwningProcess,}
+        . q{@{Name='CreationTime';Expression={if ($_.CreationTime) {$_.CreationTime.ToString('yyyy-MM-dd HH:mm:ss')} else {''}}} }
         . q{| ConvertTo-Csv -NoTypeInformation"};
 
     my @udp_lines = _cmd($ps_udp);

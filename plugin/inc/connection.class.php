@@ -314,7 +314,10 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     MAX(remote_items_id) AS remote_items_id,
                     MAX(remote_itemtype) AS remote_itemtype,
                     MAX(remote_scope) AS remote_scope,
-                    MAX(IF(IFNULL(created_at + 0, 0) > 0, created_at, NULL)) AS created_at,
+                    -- Safe to MAX once the column is clean: hook.php migration drops
+                    -- and re-adds with explicit_defaults_for_timestamp=1 so existing
+                    -- rows are NULL and new pushes write valid TIMESTAMP values.
+                    MAX(created_at) AS created_at,
                     COUNT(*) AS conn_count,
                     'out' AS direction
                 FROM `{$table}`
@@ -340,7 +343,10 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     MAX(remote_items_id) AS remote_items_id,
                     MAX(remote_itemtype) AS remote_itemtype,
                     MAX(remote_scope) AS remote_scope,
-                    MAX(IF(IFNULL(created_at + 0, 0) > 0, created_at, NULL)) AS created_at,
+                    -- Safe to MAX once the column is clean: hook.php migration drops
+                    -- and re-adds with explicit_defaults_for_timestamp=1 so existing
+                    -- rows are NULL and new pushes write valid TIMESTAMP values.
+                    MAX(created_at) AS created_at,
                     COUNT(*) AS conn_count,
                     'in' AS direction
                 FROM `{$table}`
@@ -367,7 +373,10 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     MAX(remote_items_id) AS remote_items_id,
                     MAX(remote_itemtype) AS remote_itemtype,
                     MAX(remote_scope) AS remote_scope,
-                    MAX(IF(IFNULL(created_at + 0, 0) > 0, created_at, NULL)) AS created_at,
+                    -- Safe to MAX once the column is clean: hook.php migration drops
+                    -- and re-adds with explicit_defaults_for_timestamp=1 so existing
+                    -- rows are NULL and new pushes write valid TIMESTAMP values.
+                    MAX(created_at) AS created_at,
                     COUNT(*) AS conn_count,
                     'out' AS direction
                 FROM `{$table}`
@@ -402,7 +411,10 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     MAX(remote_items_id) AS remote_items_id,
                     MAX(remote_itemtype) AS remote_itemtype,
                     MAX(remote_scope) AS remote_scope,
-                    MAX(IF(IFNULL(created_at + 0, 0) > 0, created_at, NULL)) AS created_at,
+                    -- Safe to MAX once the column is clean: hook.php migration drops
+                    -- and re-adds with explicit_defaults_for_timestamp=1 so existing
+                    -- rows are NULL and new pushes write valid TIMESTAMP values.
+                    MAX(created_at) AS created_at,
                     COUNT(*) AS conn_count,
                     CASE
                         WHEN remote_port >= {$ephemeral} THEN 'in'

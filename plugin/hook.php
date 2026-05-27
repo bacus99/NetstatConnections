@@ -55,7 +55,11 @@ function plugin_netstatconnections_install(): bool {
             `collected_at`      TIMESTAMP    NULL DEFAULT NULL,
             `last_seen`         TIMESTAMP    NULL DEFAULT NULL,
             `connection_status` ENUM('active','closed') NOT NULL DEFAULT 'active',
-            `created_at`        TIMESTAMP    NULL DEFAULT NULL,
+            -- created_at: always a real, valid TIMESTAMP. NULL and zero-date are
+            -- both type-invalid (MySQL TIMESTAMP range is 1970-01-01..2038-01-19),
+            -- so we use NOT NULL DEFAULT CURRENT_TIMESTAMP. push.php always passes
+            -- a validated datetime; if absent the column default kicks in cleanly.
+            `created_at`        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `is_locked`         TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `impact_direction`  ENUM('depends','impacts') DEFAULT NULL,
             `remote_items_id`   INT UNSIGNED DEFAULT NULL,
@@ -84,7 +88,7 @@ function plugin_netstatconnections_install(): bool {
     $conn_cols = [
         'last_seen'         => "TIMESTAMP NULL DEFAULT NULL AFTER `collected_at`",
         'connection_status' => "ENUM('active','closed') NOT NULL DEFAULT 'active' AFTER `last_seen`",
-        'created_at'        => "TIMESTAMP NULL DEFAULT NULL AFTER `connection_status`",
+        'created_at'        => "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP AFTER `connection_status`",
         'remote_items_id'   => "INT UNSIGNED DEFAULT NULL AFTER `impact_direction`",
         'remote_itemtype'   => "VARCHAR(100) DEFAULT NULL AFTER `remote_items_id`",
         'remote_scope'      => "VARCHAR(20) DEFAULT NULL AFTER `remote_itemtype`",
@@ -152,19 +156,64 @@ function plugin_netstatconnections_install(): bool {
         }
     }
 
-    // Convert created_at back to TIMESTAMP if it was migrated to DATETIME previously
+    // Cleanup + migration for created_at to NOT NULL DEFAULT CURRENT_TIMESTAMP.
+    //
+    // The core insight: MySQL TIMESTAMP's valid range is 1970-01-01 00:00:01 to
+    // 2038-01-19 03:14:07. Both NULL (via NULLable column) and '0000-00-00 00:00:00'
+    // (via legacy default) are type-invalid edge cases that cause more trouble than
+    // they're worth on MySQL 8.x with NO_ZERO_DATE.
+    //
+    // New design: created_at is ALWAYS a real, valid timestamp. push.php's INSERT
+    // path falls back through agent-supplied → collected_at → NOW(). The column
+    // itself uses NOT NULL DEFAULT CURRENT_TIMESTAMP so any path that omits the
+    // value still gets a valid timestamp from the engine.
+    //
+    // Migration from legacy (NULLable / zero-date-defaulted) column:
+    //   1. Detect legacy state
+    //   2. Drop the column (discards bad data, ALTER doesn't error)
+    //   3. Re-add as NOT NULL DEFAULT CURRENT_TIMESTAMP — existing rows get NOW()
+    //   4. Backfill from collected_at where available — better than NOW() for legacy rows
+    //
+    // explicit_defaults_for_timestamp doesn't matter here: NOT NULL DEFAULT
+    // CURRENT_TIMESTAMP is honored under every MySQL configuration.
     if ($DB->fieldExists($table, 'created_at')) {
         $res      = $DB->doQuery("SHOW COLUMNS FROM `{$table}` WHERE Field = 'created_at'");
         $col_info = $DB->fetchAssoc($res);
-        if ($col_info && stripos($col_info['Type'], 'timestamp') === false) {
-            // Null out invalid values first (empty string or zero-dates) under strict mode
-            try {
-                $DB->doQuery("UPDATE `{$table}` SET `created_at` = NULL WHERE `created_at` < '1970-01-02'");
-            } catch (\Throwable $e) { /* ignore */ }
-            try {
-                $DB->doQuery("UPDATE `{$table}` SET `created_at` = NULL WHERE `created_at` = ''");
-            } catch (\Throwable $e) { /* ignore */ }
-            $DB->doQuery("ALTER TABLE `{$table}` MODIFY `created_at` TIMESTAMP NULL DEFAULT NULL");
+        if ($col_info) {
+            $is_timestamp     = (stripos($col_info['Type'], 'timestamp') !== false);
+            $is_nullable      = (($col_info['Null'] ?? 'YES') === 'YES');
+            $has_zero_default = (($col_info['Default'] ?? '') === '0000-00-00 00:00:00');
+            $has_now_default  = in_array(strtoupper((string)($col_info['Default'] ?? '')),
+                                         ['CURRENT_TIMESTAMP', 'CURRENT_TIMESTAMP()'], true);
+
+            // Needs migration if: NULLable OR has zero-date default OR not CURRENT_TIMESTAMP default
+            $needs_migration = $is_timestamp && ($is_nullable || $has_zero_default || !$has_now_default);
+
+            if ($needs_migration) {
+                // Clear strict mode so reading legacy bad values during ALTER doesn't error
+                try { $DB->doQuery("SET SESSION sql_mode = ''"); }
+                catch (\Throwable $e) { /* best effort */ }
+
+                try {
+                    $DB->doQuery("ALTER TABLE `{$table}` DROP COLUMN `created_at`");
+                } catch (\Throwable $e) { /* ignore */ }
+                try {
+                    $DB->doQuery("ALTER TABLE `{$table}` ADD COLUMN `created_at` "
+                        . "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP AFTER `connection_status`");
+                } catch (\Throwable $e) { /* ignore */ }
+
+                // Backfill: use collected_at as the proxy for "first seen" where it's
+                // a valid timestamp. Better than NOW() for legacy rows. Rows without
+                // a valid collected_at keep the CURRENT_TIMESTAMP default (= now).
+                try {
+                    $DB->doQuery("UPDATE `{$table}` SET `created_at` = `collected_at` "
+                        . "WHERE `collected_at` IS NOT NULL "
+                        . "AND `collected_at` >= '1970-01-02 00:00:00'");
+                } catch (\Throwable $e) { /* ignore */ }
+
+                try { $DB->doQuery("SET SESSION sql_mode = DEFAULT"); }
+                catch (\Throwable $e) { /* ignore */ }
+            }
         }
     }
 
