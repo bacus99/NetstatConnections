@@ -31,7 +31,7 @@
  *     are auto-fetched by agents.
  */
 
-define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.2.2');
+define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.5.0');
 define('PLUGIN_NETSTATCONNECTIONS_MIN_GLPI', '11.0.0');
 define('PLUGIN_NETSTATCONNECTIONS_MAX_GLPI', '12.0.0');
 
@@ -60,6 +60,8 @@ function plugin_init_netstatconnections(): void {
     // Register classes
     Plugin::registerClass('PluginNetstatconnectionsConnection', ['addtabon' => ['Computer']]);
     Plugin::registerClass('PluginNetstatconnectionsPort');
+    // Relation Types dropdown — backed by inc/relationtype.class.php +
+    // front/relationtype.php + relationtype.form.php (v2.5.0).
     Plugin::registerClass('PluginNetstatconnectionsRelationtype');
 
     // Config page link

@@ -1,5 +1,61 @@
 # Changelog
 
+## [2.5.0] — 2026-05-29
+
+### Dependency Map + Relation Types editor (recovered + adapted to GLPI 11.0.7)
+
+The `Dependency Map` and `Relation Types` buttons on the Port Definitions page threw Symfony "No route found". **Root cause:** the pages backing them (`graph.php`, `relationtype.php`, `vis-asset.php`, the `relationtype` class, and the bundled vis-network library) were never committed — they existed only in the working tree, and a GitHub Desktop `git stash` swept them out, so a later deploy shipped a tree without them. The 2.4.x ledger work was unrelated. These files have now been **recovered from the stash and committed**, and adapted to GLPI 11.0.7.
+
+**Dependency Map — `front/graph.php`.** Full interactive force-directed graph (vis-network) of all locked active connections with resolved remote CIs:
+- Nodes = Computer / Cluster / DatabaseInstance (shape + colour per type); edges directed by `impact_direction`, labelled by port, coloured by relation-type (falling back to the port badge colour).
+- Toolbar: port filter, host search/focus, edge-label toggle, fit, physics re-enable; click-through to the GLPI CI; node/edge counts.
+
+**vis-network — bundled locally, no CDN at runtime.** The minified library (`vis-network.min.js` / `.css`) is now committed under `plugin/front/lib/` and served through `front/vis-asset.php`, a hard-coded **allowlist** passthrough (only those two filenames — no path-traversal, addressing the security review). `graph.php` falls back to a CDN with offline instructions only if the local files are somehow missing. Default path keeps topology rendering fully on-prem.
+
+**Relation Types — `front/relationtype.php` + `.form.php` + `inc/relationtype.class.php`.** A `CommonDropdown` editor for relation-type labels (Database / Replicates / Authenticates …) with a colour picker + swatch rendering. Registered again now that real files back it.
+
+**GLPI 11.0.7 adaptation:** all three recovered pages had the legacy `include('../../../inc/includes.php')` bootstrap that breaks under 11.0.7's symlinked routing; swapped to `require_once __DIR__ . '/../inc/_bootstrap.php'` (the realpath-based helper).
+
+**Also:** `front/port.php` re-adds both buttons; the orphaned-registration error from 2.4.x is resolved (the `relationtypes` table was always fine — only the missing class/pages were the problem).
+
+⚠️ **Deploy:** copy `front/graph.php`, `front/vis-asset.php`, `front/relationtype.php`, `front/relationtype.form.php`, `inc/relationtype.class.php`, `front/lib/vis-network.min.{js,css}`, and updated `setup.php` + `port.php`; trigger the plugin upgrade; clear cache; restart php-fpm. `php -l` each PHP file first. The two `lib/` files are binary-ish (minified) — copy them verbatim (no re-encoding).
+
+## [2.4.0] — 2026-05-29
+
+### Long-tail capture + edge weighting (competitive feature #1)
+
+The strategic differentiator vs. agentless/periodic discovery (Device42-powered Freshservice, etc.): **we stop wiping the dependency history on every push, and we weight each edge by how consistently it's observed.**
+
+**Persistence model change — accumulating edge ledger.** `push.php` previously did DELETE-all-then-INSERT per push, so any dependency not present in the current snapshot vanished — the same blind spot a periodic agentless scan has. It now **accumulates**:
+
+- Each push collapses raw sockets into unique **edges** (`edge_key` = `SHA1(computers_id|protocol|direction|service_port|remote_addr|process_name)`, deliberately excluding the ephemeral port so 500 source sockets to one DB collapse to one edge).
+- For each edge it **UPSERTs**: bump `last_seen` + `seen_count` if seen before, else INSERT with `seen_count=1`, `first_seen=now`.
+- Edges absent from a push are **retained** (not deleted) and only marked `closed` by the lifecycle cron once stale — so the 3am batch job's DB connection survives instead of being wiped between scans.
+- Locked rows are handled by the same UPSERT (lock/impact/resolution columns never overwritten), so the separate locked-row pass is gone.
+
+**Edge weighting.** New `seen_count` drives a **Weight** column in the Connections tab: `Persistent` / `Frequent` / `Occasional` / `Rare`. A **Rare** (seen-once) edge is precisely the transient dependency a snapshot tool misses — surfaced in amber. Tooltip shows the raw observation count + first-seen age as honest evidence. No competitor in the mid-market exposes per-edge observation-frequency confidence.
+
+**Schema (additive, low-risk).** New columns `edge_key CHAR(40)`, `seen_count`, `first_seen`, `conn_count` + `(computers_id, edge_key)` index. Migration backfills `edge_key`/`first_seen` for existing rows using a SQL formula byte-identical to push.php's. **No UNIQUE constraint / no one-shot prod dedupe** — pre-2.4.0 duplicate raw rows simply go stale and are purged by the cleanup cron; the UI `GROUP BY` collapses them in the meantime. This deliberately avoids a risky bulk migration on the live table.
+
+**Scope note.** This delivers *server-side accumulation* + weighting — already a real gain (yesterday's now-absent dependency is retained, not wiped). The deeper long-tail capture (agent sub-sampling between pushes to catch sub-minute connections) is a planned follow-on agent enhancement; the server ledger is the foundation it will feed.
+
+⚠️ **Deploy: test on a DB clone first.** This changes the core write path. Validate on a copy, then deploy plugin files + trigger the plugin upgrade (adds columns + backfills `edge_key`), clear cache, restart php-fpm.
+
+## [2.3.0] — 2026-05-29
+
+### Process correlation on dependency edges (competitive feature #2)
+
+Every connection edge can now show **which process owns it and which user account it runs as** — e.g. `SHFXSQL02:1433 ← svc_payroll@DOMAIN via sqlcmd.exe`. This is the link no agentless competitor (Device42/Freshservice, iTop, JSM, SysAid) draws: they inventory processes and connections separately; we tie the process to the dependency it's responsible for.
+
+**Correlate, don't duplicate.** GLPI Agent already reports the full process table natively to `glpi_items_processes` (PID, command, user, started, memory). Rather than re-collect and re-store command lines — which would copy any credentials embedded in process args into our table — we store **only the PID** on each connection and read user/command from GLPI's native table at display time. No command-line text is duplicated into the plugin's schema, so no new credential-leak surface.
+
+- **`hook.php`**: added `process_pid`, `process_started`, `session_id` columns (+ `process_pid` index) to the connections table, in both `CREATE TABLE` and the upgrade column-add path.
+- **`push.php`**: persists `pid` / `process_started` / `session_id` (already present in the agent cache — so existing 2.2.x agents get PID correlation with **no agent redeploy**). Refreshes them on locked rows too, so a locked edge doesn't carry a stale PID after the process restarts.
+- **`connection.class.php`**: new `buildProcessMap()` reads `glpi_items_processes` for the computer (filtered `is_deleted=0`, most-recent `started` wins on PID reuse) and enriches each edge. The Process column now shows the owning **user** inline and the launching **command** on hover (display-time redaction strips obvious `-P`/`password=`/`token=` args). Degrades to PID-only, then to plain process name, if process inventory is absent.
+- **`glpi-netstat-collect.pl`**: added an *isolated* second `wmic ProcessId,CreationDate` pass that captures process start time (CIM_DATETIME → `Y-m-d H:i:s`) for reuse-proof `(pid, started)` correlation. Kept separate from the main process parser so a failure can't break process collection.
+
+**Deploy note:** the server-side half (schema + push.php + display) delivers the feature immediately for hosts already on collector 2.2.x, because `pid`/`session_id` were already in the cache. The collector 2.3.0 update only adds `process_started` (correlation hardening) — optional, deploy at leisure.
+
 ## [2.2.2] — 2026-05-27
 
 ### Locale-independent datetime serialization

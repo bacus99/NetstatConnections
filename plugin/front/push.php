@@ -163,6 +163,39 @@ function normalize_datetime(?string $val): ?string {
 $collected = normalize_datetime((string)($body['collected_at'] ?? ''))
           ?? date('Y-m-d H:i:s');
 
+/**
+ * Stable identity for a dependency "edge", independent of the ephemeral port.
+ * MUST stay byte-for-byte identical to the SHA1(CONCAT_WS('|', ...)) formula in
+ * hook.php's backfill, or accumulated history won't match new pushes.
+ *
+ *   outbound: peer = remote_addr, service = remote_port
+ *   inbound:  peer = remote_addr, service = local_port
+ *
+ * Ephemeral ports are deliberately excluded so the 500 ephemeral source sockets
+ * of one host→DB dependency collapse to ONE edge whose seen_count accumulates.
+ */
+function edge_key_for(int $computers_id, string $proto, string $dir, int $svc, string $raddr, string $pname): string {
+    return sha1(
+        $computers_id . '|' . strtoupper($proto) . '|' . $dir . '|'
+        . $svc . '|' . strtolower($raddr) . '|' . strtolower($pname)
+    );
+}
+
+/** Derive (direction, service_port) the same way the migration backfill does. */
+function derive_edge(array $c): array {
+    $rport = (int)($c['remote_port'] ?? 0);
+    $lport = (int)($c['local_port']  ?? 0);
+    $dir   = (string)($c['conn_direction'] ?? '');
+    if ($dir === '') {
+        $dir = ($rport >= 49152 && $lport < 49152) ? 'inbound' : 'outbound';
+    }
+    $svc = (int)($c['service_port'] ?? 0);
+    if ($svc === 0) {
+        $svc = ($dir === 'inbound') ? $lport : $rport;
+    }
+    return [$dir, $svc];
+}
+
 $connections = is_array($body['connections'] ?? null) ? $body['connections'] : [];
 
 // ── Apply server-side filters (from agent_collection config) ─────────────
@@ -224,82 +257,129 @@ foreach ($connections as $c) {
 }
 $connections = $filtered;
 
-// ── Persist connections ──────────────────────────────────────────────────
-// Lifecycle pattern (from PluginNetstatconnectionsConnection::handleInventory):
-//   1. Mark all existing rows for this computer as 'closed' with current ts as last_seen
-//      base — we'll reset last_seen=now() for ones we still see.
-//   2. For each incoming connection: UPSERT (insert or update last_seen).
-//   3. Rows whose last_seen wasn't bumped are effectively closed.
+// ── Persist connections — accumulating edge ledger (v2.4.0) ───────────────
+// We NO LONGER delete-and-replace. Instead each push ACCUMULATES observations:
 //
-// Simpler approach used here: REPLACE-style (delete+insert) for the active rows,
-// preserving locked rows (is_locked=1) and respecting impact_direction.
+//   1. Collapse the push's raw connections into unique EDGES (by edge_key),
+//      counting how many raw sockets map to each edge this push (conn_count).
+//   2. For each edge: UPSERT — if it already exists for this computer, bump
+//      last_seen + seen_count (the consistency/weight signal) and refresh the
+//      volatile fields; otherwise INSERT it with seen_count=1, first_seen=now.
+//   3. Edges NOT in this push are left untouched — they keep their last_seen and
+//      get marked 'closed' by the lifecycle cron once stale. This is the whole
+//      point: we retain the long tail (the 3am batch job's DB connection that a
+//      periodic agentless scan would miss) instead of wiping it every push.
+//
+// Locked rows are handled by the SAME upsert (is_locked / impact_direction /
+// resolution columns are never overwritten), so no separate locked-row pass.
+//
+// Matching is by (computers_id, edge_key) with a non-unique index — no UNIQUE
+// constraint, so no risky one-shot dedupe of existing prod rows is required.
+// Any pre-2.4.0 duplicate raw rows for an edge simply go stale and are purged
+// by the cleanup cron; the UI GROUP BY collapses them in the meantime.
+
+// Collapse raw connections → edges
+$edges = [];   // edge_key => ['c' => representative conn, 'count' => raw sockets this push]
+foreach ($connections as $c) {
+    if (!is_array($c)) continue;
+    [$dir, $svc] = derive_edge($c);
+    $ek = edge_key_for(
+        $computers_id,
+        (string)($c['protocol'] ?? 'TCP'),
+        $dir, $svc,
+        (string)($c['remote_addr'] ?? ''),
+        (string)($c['process_name'] ?? '')
+    );
+    if (!isset($edges[$ek])) {
+        $c['_dir'] = $dir;
+        $c['_svc'] = $svc;
+        $edges[$ek] = ['c' => $c, 'count' => 0];
+    }
+    $edges[$ek]['count']++;
+}
 
 $pdo->beginTransaction();
 try {
-    // Delete non-locked active rows for this computer that we'll replace
-    $del = $pdo->prepare("DELETE FROM glpi_plugin_netstatconnections_connections
-                          WHERE computers_id = ? AND is_locked = 0 AND connection_status = 'active'");
-    $del->execute([$computers_id]);
+    // Find an existing row for this edge (prefer a locked one, then most recent).
+    $sel = $pdo->prepare("SELECT id FROM glpi_plugin_netstatconnections_connections
+        WHERE computers_id = ? AND edge_key = ?
+        ORDER BY is_locked DESC, last_seen DESC, id DESC LIMIT 1");
 
+    // INSERT a brand-new edge.
     $ins = $pdo->prepare("INSERT INTO glpi_plugin_netstatconnections_connections
-        (computers_id, protocol, local_addr, local_port, remote_addr, remote_port,
+        (edge_key, computers_id, protocol, local_addr, local_port, remote_addr, remote_port,
          remote_hostname, process_name, service_name, state, collected_at, last_seen,
-         connection_status, created_at, conn_direction, service_port,
-         collection_method, offload_state, applied_setting)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)");
+         connection_status, created_at, first_seen, seen_count, conn_count,
+         conn_direction, service_port, collection_method, offload_state, applied_setting,
+         process_pid, process_started, session_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+
+    // UPDATE an existing edge — bump observation counters + refresh volatile fields.
+    // Never touches: is_locked, impact_direction, first_seen, created_at,
+    // remote_items_id, remote_itemtype, remote_scope, resolved_via, resolved_at.
+    $upd = $pdo->prepare("UPDATE glpi_plugin_netstatconnections_connections
+        SET last_seen = ?, collected_at = ?, connection_status = 'active',
+            seen_count = seen_count + 1, conn_count = ?,
+            state = ?, remote_hostname = ?, local_addr = ?, local_port = ?,
+            remote_port = ?, service_name = ?, collection_method = ?,
+            offload_state = ?, applied_setting = ?,
+            process_pid = ?, process_started = ?, session_id = ?
+        WHERE id = ?");
 
     $count = 0;
-    foreach ($connections as $c) {
-        if (!is_array($c)) continue;
-        // Always write a VALID TIMESTAMP for created_at — never NULL, never zero-date.
-        // MySQL TIMESTAMP's valid range is 1970-01-01 00:00:01 .. 2038-01-19 03:14:07,
-        // so any value outside that range is type-invalid. Fall back through the chain:
-        //   1. Agent-supplied $c['created_at']  (parsed via normalize_datetime so
-        //      "2026-05-10 10:02:05 AM" / ISO / etc. all become canonical 'Y-m-d H:i:s')
-        //   2. $collected (the push's collected_at — already normalized above)
-        //   3. NOW() — pre-validated by push.php so always within range
-        $created_at = normalize_datetime((string)($c['created_at'] ?? ''))
-                   ?? $collected;
-        $ins->execute([
-            $computers_id,
-            (string)($c['protocol']        ?? 'TCP'),
-            (string)($c['local_addr']      ?? ''),
-            (int)   ($c['local_port']      ?? 0),
-            (string)($c['remote_addr']     ?? ''),
-            (int)   ($c['remote_port']     ?? 0),
-            (string)($c['remote_hostname'] ?? ''),
-            (string)($c['process_name']    ?? ''),
-            (string)($c['service_name']    ?? ''),
-            (string)($c['state']           ?? ''),
-            $collected,
-            $collected,
-            $created_at,
-            (string)($c['conn_direction']  ?? ''),
-            (int)   ($c['service_port']    ?? 0),
-            $method,
-            (string)($c['offload_state']   ?? ''),
-            (string)($c['applied_setting'] ?? ''),
-        ]);
+    foreach ($edges as $ek => $edge) {
+        $c          = $edge['c'];
+        $raw_count  = $edge['count'];
+        $created_at = normalize_datetime((string)($c['created_at'] ?? '')) ?? $collected;
+        $pstarted   = normalize_datetime((string)($c['process_started'] ?? ''));
+        $ppid       = ((int)($c['pid'] ?? 0)) ?: null;
+        $psession   = (isset($c['session_id']) && $c['session_id'] !== '') ? (int)$c['session_id'] : null;
+
+        $sel->execute([$computers_id, $ek]);
+        $existing_id = (int)($sel->fetchColumn() ?: 0);
+
+        if ($existing_id > 0) {
+            $upd->execute([
+                $collected, $collected, $raw_count,
+                (string)($c['state']           ?? ''),
+                (string)($c['remote_hostname'] ?? ''),
+                (string)($c['local_addr']      ?? ''),
+                (int)   ($c['local_port']      ?? 0),
+                (int)   ($c['remote_port']     ?? 0),
+                (string)($c['service_name']    ?? ''),
+                $method,
+                (string)($c['offload_state']   ?? ''),
+                (string)($c['applied_setting'] ?? ''),
+                $ppid, $pstarted, $psession,
+                $existing_id,
+            ]);
+        } else {
+            $ins->execute([
+                $ek,
+                $computers_id,
+                (string)($c['protocol']        ?? 'TCP'),
+                (string)($c['local_addr']      ?? ''),
+                (int)   ($c['local_port']      ?? 0),
+                (string)($c['remote_addr']     ?? ''),
+                (int)   ($c['remote_port']     ?? 0),
+                (string)($c['remote_hostname'] ?? ''),
+                (string)($c['process_name']    ?? ''),
+                (string)($c['service_name']    ?? ''),
+                (string)($c['state']           ?? ''),
+                $collected,
+                $collected,
+                $created_at,
+                $collected,          // first_seen
+                $raw_count,          // conn_count
+                (string)($c['_dir'] ?? ''),
+                (int)   ($c['_svc'] ?? 0),
+                $method,
+                (string)($c['offload_state']   ?? ''),
+                (string)($c['applied_setting'] ?? ''),
+                $ppid, $pstarted, $psession,
+            ]);
+        }
         $count++;
-    }
-
-    // Bump last_seen on locked rows that match connections still reported by the
-    // agent — proves the connection is still alive even though we don't replace it.
-    $upd_locked = $pdo->prepare("UPDATE glpi_plugin_netstatconnections_connections
-        SET last_seen = ?, connection_status = 'active'
-        WHERE computers_id = ? AND is_locked = 1
-          AND protocol = ? AND remote_addr = ? AND remote_port = ? AND process_name = ?");
-
-    foreach ($connections as $c) {
-        if (!is_array($c)) continue;
-        $upd_locked->execute([
-            $collected,
-            $computers_id,
-            (string)($c['protocol']     ?? 'TCP'),
-            (string)($c['remote_addr']  ?? ''),
-            (int)   ($c['remote_port']  ?? 0),
-            (string)($c['process_name'] ?? ''),
-        ]);
     }
 
     $pdo->commit();

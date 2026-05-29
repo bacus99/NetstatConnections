@@ -26,7 +26,7 @@ use Getopt::Long;
 use Socket       qw(inet_aton AF_INET);
 use JSON::PP;
 
-our $VERSION = '2.2.2';
+our $VERSION = '2.3.0';
 
 # ---------------------------------------------------------------------------
 # Options
@@ -341,6 +341,7 @@ for my $c (@connections) {
     $c->{description}     = $proc{$pid}{description} // '';
     $c->{session_id}      = $proc{$pid}{session_id}  // 0;
     $c->{cmd}             = $proc{$pid}{cmd}          // '';
+    $c->{process_started} = $proc{$pid}{started}      // '';
     $c->{conn_direction}  = $conn_direction;
     # For inbound, the "service port" is local_port
     $c->{service_port}    = ($conn_direction eq 'inbound') ? $lport : $rport;
@@ -660,7 +661,31 @@ sub _collectProcessesWindows {
             cmd         => $cmd,
             session_id  => $session_id,
             mem_kb      => $mem_kb,
+            started     => '',
         };
+    }
+
+    # ── Isolated second pass: process start times ─────────────────────────
+    # Kept SEPARATE from the main parse above so a failure here can never break
+    # process collection. CreationDate is CIM_DATETIME (YYYYMMDDHHMMSS.ffffff±UTC);
+    # we normalize to 'YYYY-MM-DD HH:MM:SS' to correlate against
+    # glpi_items_processes.started on the server. If this pass returns nothing,
+    # `started` stays '' and the server falls back to PID-only correlation.
+    my @ct_lines = _cmd('wmic process get ProcessId,CreationDate /format:csv');
+    for my $line (@ct_lines) {
+        $line =~ s/\r|\n//g;
+        next unless $line =~ /\S/;
+        # Columns are alphabetical: Node,CreationDate,ProcessId
+        my @p = split /,/, $line, -1;
+        next unless @p >= 3;
+        my $pid_raw = pop @p;   # ProcessId
+        my $cd_raw  = pop @p;   # CreationDate (comma-free)
+        next unless ($pid_raw // '') =~ /^\d+$/;
+        my $pid = int($pid_raw);
+        next unless exists $proc{$pid};
+        if (($cd_raw // '') =~ /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/) {
+            $proc{$pid}{started} = "$1-$2-$3 $4:$5:$6";
+        }
     }
 }
 sub _collectProcessesLinux {

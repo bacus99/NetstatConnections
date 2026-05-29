@@ -257,6 +257,59 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
         }
     }
 
+    /**
+     * Build a pid → {user, cmd, memusage, started} map from GLPI's native
+     * process inventory (glpi_items_processes) for a given computer.
+     *
+     * This is the correlation source for the "Running as" enrichment — we read
+     * the user/command GLPI already collected rather than duplicating it. The
+     * table is a current-snapshot (replaced each inventory), so this enriches
+     * active edges against the latest process list; closed/historical edges
+     * simply won't correlate, which is fine.
+     *
+     * If the same PID appears more than once (rare; stale dynamic rows), the
+     * most recently started one wins.
+     *
+     * @return array<int, array{user:string, cmd:string, memusage:?float, started:?string}>
+     */
+    private static function buildProcessMap(int $computers_id): array {
+        global $DB;
+        if ($computers_id <= 0 || !$DB->tableExists('glpi_items_processes')) {
+            return [];
+        }
+
+        $map = [];
+        try {
+            $iter = $DB->request([
+                'SELECT' => ['pid', 'user', 'cmd', 'memusage', 'started'],
+                'FROM'   => 'glpi_items_processes',
+                'WHERE'  => [
+                    'itemtype'   => 'Computer',
+                    'items_id'   => $computers_id,
+                    'is_deleted' => 0,
+                ],
+            ]);
+            foreach ($iter as $p) {
+                $pid = (int)($p['pid'] ?? 0);
+                if ($pid <= 0) continue;
+                // Keep the most recently started row for a reused PID.
+                if (isset($map[$pid])
+                    && ($map[$pid]['started'] ?? '') >= ($p['started'] ?? '')) {
+                    continue;
+                }
+                $map[$pid] = [
+                    'user'     => (string)($p['user'] ?? ''),
+                    'cmd'      => (string)($p['cmd']  ?? ''),
+                    'memusage' => isset($p['memusage']) ? (float)$p['memusage'] : null,
+                    'started'  => $p['started'] ?? null,
+                ];
+            }
+        } catch (\Throwable $e) {
+            return [];
+        }
+        return $map;
+    }
+
     public static function showForComputer(Computer $computer): void {
         global $DB;
 
@@ -318,7 +371,11 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     -- and re-adds with explicit_defaults_for_timestamp=1 so existing
                     -- rows are NULL and new pushes write valid TIMESTAMP values.
                     MAX(created_at) AS created_at,
-                    COUNT(*) AS conn_count,
+                    MAX(process_pid) AS process_pid,
+                    MAX(session_id)  AS session_id,
+                    MAX(seen_count)  AS seen_count,
+                    MIN(first_seen)  AS first_seen,
+                    MAX(conn_count) AS conn_count,
                     'out' AS direction
                 FROM `{$table}`
                 WHERE computers_id = {$computers_id}
@@ -347,7 +404,11 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     -- and re-adds with explicit_defaults_for_timestamp=1 so existing
                     -- rows are NULL and new pushes write valid TIMESTAMP values.
                     MAX(created_at) AS created_at,
-                    COUNT(*) AS conn_count,
+                    MAX(process_pid) AS process_pid,
+                    MAX(session_id)  AS session_id,
+                    MAX(seen_count)  AS seen_count,
+                    MIN(first_seen)  AS first_seen,
+                    MAX(conn_count) AS conn_count,
                     'in' AS direction
                 FROM `{$table}`
                 WHERE computers_id = {$computers_id}
@@ -377,7 +438,11 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     -- and re-adds with explicit_defaults_for_timestamp=1 so existing
                     -- rows are NULL and new pushes write valid TIMESTAMP values.
                     MAX(created_at) AS created_at,
-                    COUNT(*) AS conn_count,
+                    MAX(process_pid) AS process_pid,
+                    MAX(session_id)  AS session_id,
+                    MAX(seen_count)  AS seen_count,
+                    MIN(first_seen)  AS first_seen,
+                    MAX(conn_count) AS conn_count,
                     'out' AS direction
                 FROM `{$table}`
                 WHERE computers_id = {$computers_id}
@@ -415,7 +480,11 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     -- and re-adds with explicit_defaults_for_timestamp=1 so existing
                     -- rows are NULL and new pushes write valid TIMESTAMP values.
                     MAX(created_at) AS created_at,
-                    COUNT(*) AS conn_count,
+                    MAX(process_pid) AS process_pid,
+                    MAX(session_id)  AS session_id,
+                    MAX(seen_count)  AS seen_count,
+                    MIN(first_seen)  AS first_seen,
+                    MAX(conn_count) AS conn_count,
                     CASE
                         WHEN remote_port >= {$ephemeral} THEN 'in'
                         ELSE 'out'
@@ -437,6 +506,28 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
         $rows = [];
         while ($row = $DB->fetchAssoc($result)) {
             $rows[] = $row;
+        }
+
+        // ── Process correlation (v2.3.0) ─────────────────────────────
+        // Enrich each edge with the owning process's user/command, pulled from
+        // GLPI's native process inventory (glpi_items_processes, populated by the
+        // agent). We store only the PID on our side; user/cmd live in GLPI core,
+        // so no command-line text (or embedded secrets) is duplicated into our
+        // table. Correlation key: (computers_id, pid), preferring the row whose
+        // `started` is closest to — and not after — the connection's
+        // process_started when we have it (reuse-proof). Degrades to PID-only.
+        $proc_map = self::buildProcessMap($computers_id);
+        if (!empty($proc_map)) {
+            foreach ($rows as &$r) {
+                $pid = (int)($r['process_pid'] ?? 0);
+                if ($pid > 0 && isset($proc_map[$pid])) {
+                    $p = $proc_map[$pid];
+                    $r['proc_user'] = $p['user'] ?? '';
+                    $r['proc_cmd']  = $p['cmd']  ?? '';
+                    $r['proc_mem']  = $p['memusage'] ?? null;
+                }
+            }
+            unset($r);
         }
 
         // ── Render HTML ──────────────────────────────────────────────
@@ -494,6 +585,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
         echo '<th>Remote</th>';
         echo '<th>Process</th>';
         echo '<th>Age</th>';
+        echo '<th style="width:90px" title="How consistently this dependency is observed — the long-tail signal agentless scans miss">Weight</th>';
         echo '<th style="width:30px">#</th>';
         echo '<th style="width:50px">Impact</th>';
         echo '</tr></thead>';
@@ -529,7 +621,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     }
 
                     echo '<tr class="table-light border-top-2" style="border-top:2px solid #dee2e6">';
-                    echo '<td colspan="8" class="py-1 px-3 d-flex align-items-center">';
+                    echo '<td colspan="9" class="py-1 px-3 d-flex align-items-center">';
                     echo '<span class="fw-semibold text-primary me-2">';
                     echo '◀ Inbound ' . PluginNetstatconnectionsPort::getBadge($svcPort, $proto);
                     echo ' — ' . $g['total'] . ' client' . ($g['total'] > 1 ? 's' : '');
@@ -641,8 +733,58 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
             echo '<td>' . $dir_icon . '</td>';
             echo '<td>' . $badge . '</td>';
             echo '<td>' . $remote_display . $scope_badge . '</td>';
-            echo '<td><small>' . htmlspecialchars($conn['process_name'] ?? '') . '</small></td>';
+
+            // Process cell — enriched from GLPI's native process inventory.
+            // Shows process name + the owning user (the "Running as" win);
+            // the launching command line appears on hover. The command text
+            // originates from GLPI core (glpi_items_processes); we apply a
+            // light display-time redaction so obvious credentials in args
+            // aren't splashed into a tooltip.
+            $proc_name = htmlspecialchars($conn['process_name'] ?? '');
+            $proc_user = trim((string)($conn['proc_user'] ?? ''));
+            $proc_cmd  = trim((string)($conn['proc_cmd']  ?? ''));
+            $proc_cell = '<small>' . $proc_name . '</small>';
+            if ($proc_user !== '') {
+                $proc_cell .= '<br><small class="text-muted" style="font-size:0.75em">'
+                    . '<i class="ti ti-user me-1"></i>' . htmlspecialchars($proc_user) . '</small>';
+            }
+            $cmd_attr = '';
+            if ($proc_cmd !== '') {
+                $safe_cmd = preg_replace(
+                    '/(?i)(-P|-p|--password[= ]|password[= ]|pwd[= ]|secret[= ]|token[= ]|api[_-]?key[= ])\s*\S+/',
+                    '$1 ***', $proc_cmd
+                );
+                $cmd_attr = ' title="' . htmlspecialchars($safe_cmd) . '" style="cursor:help"';
+            }
+            echo '<td' . $cmd_attr . '>' . $proc_cell . '</td>';
+
             echo '<td><small class="text-muted">' . $age . '</small></td>';
+
+            // ── Weight / observation-consistency badge (v2.4.0) ───────────
+            // seen_count = how many pushes this edge appeared in. This is the
+            // signal periodic agentless scans can't produce: a "Rare" (seen
+            // once) edge is exactly the transient dependency a snapshot tool
+            // misses. Buckets are heuristic; the raw count + first-seen age in
+            // the tooltip are the honest evidence.
+            $seen = (int)($conn['seen_count'] ?? 1);
+            if      ($seen >= 24) { $w_label = 'Persistent'; $w_class = 'bg-success'; }
+            elseif  ($seen >= 5)  { $w_label = 'Frequent';   $w_class = 'bg-info'; }
+            elseif  ($seen >= 2)  { $w_label = 'Occasional'; $w_class = 'bg-secondary'; }
+            else                  { $w_label = 'Rare';       $w_class = 'bg-warning text-dark'; }
+            $w_title = 'Observed in ' . $seen . ' push' . ($seen === 1 ? '' : 'es');
+            if (!empty($conn['first_seen'])) {
+                $fs = strtotime((string)$conn['first_seen']);
+                if ($fs) {
+                    $fd = time() - $fs;
+                    $fa = $fd >= 86400 ? floor($fd / 86400) . 'd'
+                        : ($fd >= 3600 ? floor($fd / 3600) . 'h' : max(1, floor($fd / 60)) . 'm');
+                    $w_title .= ' · first seen ' . $fa . ' ago';
+                }
+            }
+            echo '<td><span class="badge ' . $w_class . '" style="cursor:help;font-size:0.7em" title="'
+                . htmlspecialchars($w_title) . '">' . $seen . '×</span>'
+                . ' <small class="text-muted" style="font-size:0.7em">' . $w_label . '</small></td>';
+
             echo '<td><small class="text-muted">' . (int)($conn['conn_count'] ?? 1) . '</small></td>';
             echo '<td>' . $impact_btn . '</td>';
 

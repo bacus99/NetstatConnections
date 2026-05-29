@@ -41,9 +41,9 @@ echo '</div>';
 echo '</div></div></div>';
 
 // ── Action buttons bar ────────────────────────────────────────────────────────
-$graph_url   = Plugin::getWebDir('netstatconnections', true) . '/front/graph.php';
-$reltype_url = Plugin::getWebDir('netstatconnections', true) . '/front/relationtype.php';
 $config_url  = Plugin::getWebDir('netstatconnections', true) . '/front/config.php';
+$reltype_url = Plugin::getWebDir('netstatconnections', true) . '/front/relationtype.php';
+$graph_url   = Plugin::getWebDir('netstatconnections', true) . '/front/graph.php';
 
 echo '<div class="container-fluid mb-3">';
 echo '<div class="d-flex justify-content-between align-items-center">';

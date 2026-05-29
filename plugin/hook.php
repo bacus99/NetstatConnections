@@ -72,6 +72,24 @@ function plugin_netstatconnections_install(): bool {
             `collection_method` VARCHAR(20)  DEFAULT NULL,
             `offload_state`     VARCHAR(50)  DEFAULT NULL,
             `applied_setting`   VARCHAR(50)  DEFAULT NULL,
+            -- Process correlation: links the edge to its owning process via PID.
+            -- We do NOT store the command line or user — those live in GLPI's
+            -- native glpi_items_processes (populated by the agent's process
+            -- inventory). At display time we correlate on
+            -- (computers_id, pid [, started]) and pull user/cmd from there, so
+            -- no command-line text (and any embedded secrets) is duplicated here.
+            `process_pid`       INT UNSIGNED DEFAULT NULL,
+            `process_started`   TIMESTAMP    NULL DEFAULT NULL,
+            `session_id`        INT          DEFAULT NULL,
+            -- Edge ledger (v2.4.0): accumulate observations instead of wiping.
+            -- edge_key = stable identity (excludes ephemeral port); seen_count =
+            -- how many pushes this edge appeared in (the consistency/weight signal);
+            -- first_seen = when we first ever observed it; conn_count = raw sockets
+            -- collapsed into this edge on the most recent push.
+            `first_seen`        TIMESTAMP    NULL DEFAULT NULL,
+            `seen_count`        INT UNSIGNED NOT NULL DEFAULT 1,
+            `conn_count`        INT UNSIGNED NOT NULL DEFAULT 1,
+            `edge_key`          CHAR(40)     DEFAULT NULL,
             PRIMARY KEY (`id`),
             KEY `computers_id`      (`computers_id`),
             KEY `remote_addr`       (`remote_addr`),
@@ -80,7 +98,9 @@ function plugin_netstatconnections_install(): bool {
             KEY `collected_at`      (`collected_at`),
             KEY `last_seen`         (`last_seen`),
             KEY `connection_status` (`connection_status`),
-            KEY `resolved_via`      (`resolved_via`)
+            KEY `resolved_via`      (`resolved_via`),
+            KEY `process_pid`       (`process_pid`),
+            KEY `edge_key`          (`computers_id`,`edge_key`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
     }
 
@@ -99,6 +119,15 @@ function plugin_netstatconnections_install(): bool {
         'collection_method' => "VARCHAR(20) DEFAULT NULL AFTER `service_port`",
         'offload_state'     => "VARCHAR(50) DEFAULT NULL AFTER `collection_method`",
         'applied_setting'   => "VARCHAR(50) DEFAULT NULL AFTER `offload_state`",
+        // Process correlation (v2.3.0) — pid links to glpi_items_processes.
+        'process_pid'       => "INT UNSIGNED DEFAULT NULL AFTER `applied_setting`",
+        'process_started'   => "TIMESTAMP NULL DEFAULT NULL AFTER `process_pid`",
+        'session_id'        => "INT DEFAULT NULL AFTER `process_started`",
+        // Edge ledger (v2.4.0) — accumulating observations + weighting.
+        'first_seen'        => "TIMESTAMP NULL DEFAULT NULL AFTER `session_id`",
+        'seen_count'        => "INT UNSIGNED NOT NULL DEFAULT 1 AFTER `first_seen`",
+        'conn_count'        => "INT UNSIGNED NOT NULL DEFAULT 1 AFTER `seen_count`",
+        'edge_key'          => "CHAR(40) DEFAULT NULL AFTER `conn_count`",
     ];
 
     $table = 'glpi_plugin_netstatconnections_connections';
@@ -110,6 +139,40 @@ function plugin_netstatconnections_install(): bool {
 
     // Backfill lifecycle columns
     $DB->doQuery("UPDATE `{$table}` SET `last_seen` = `collected_at`, `connection_status` = 'active' WHERE `last_seen` IS NULL");
+
+    // ── Edge ledger backfill (v2.4.0) ─────────────────────────────────────
+    // Stamp every pre-2.4.0 row with its edge_key + first_seen so accumulating
+    // UPSERTs in push.php match existing rows. The SHA1(CONCAT_WS('|', ...))
+    // formula MUST stay byte-for-byte identical to edge_key_for() in push.php:
+    //   computers_id | UPPER(protocol) | direction | service_port |
+    //   LOWER(remote_addr) | LOWER(process_name)
+    // direction/service_port are derived with the SAME fallback push.php uses
+    // (ephemeral heuristic) when the stored columns are empty/zero.
+    if ($DB->fieldExists($table, 'edge_key')) {
+        try {
+            $DB->doQuery(
+                "UPDATE `{$table}` SET `edge_key` = SHA1(CONCAT_WS('|',
+                    `computers_id`,
+                    UPPER(`protocol`),
+                    COALESCE(NULLIF(`conn_direction`,''),
+                        CASE WHEN `remote_port` >= 49152 AND `local_port` < 49152
+                             THEN 'inbound' ELSE 'outbound' END),
+                    COALESCE(NULLIF(`service_port`,0),
+                        CASE WHEN COALESCE(NULLIF(`conn_direction`,''),
+                                 CASE WHEN `remote_port` >= 49152 AND `local_port` < 49152
+                                      THEN 'inbound' ELSE 'outbound' END) = 'inbound'
+                             THEN `local_port` ELSE `remote_port` END),
+                    LOWER(`remote_addr`),
+                    LOWER(`process_name`)
+                )) WHERE `edge_key` IS NULL"
+            );
+        } catch (\Throwable $e) { /* ignore — push.php will fill new rows regardless */ }
+    }
+    if ($DB->fieldExists($table, 'first_seen')) {
+        try {
+            $DB->doQuery("UPDATE `{$table}` SET `first_seen` = COALESCE(`first_seen`, `created_at`, `collected_at`) WHERE `first_seen` IS NULL");
+        } catch (\Throwable $e) { /* ignore */ }
+    }
 
     // Upgrade resolved_via ENUM to include all values
     if ($DB->fieldExists($table, 'resolved_via')) {
@@ -283,6 +346,8 @@ function plugin_netstatconnections_install(): bool {
         "ALTER TABLE `{$table}` ADD INDEX `last_seen`         (`last_seen`)",
         "ALTER TABLE `{$table}` ADD INDEX `connection_status` (`connection_status`)",
         "ALTER TABLE `{$table}` ADD INDEX `resolved_via`      (`resolved_via`)",
+        "ALTER TABLE `{$table}` ADD INDEX `process_pid`       (`process_pid`)",
+        "ALTER TABLE `{$table}` ADD INDEX `edge_key`          (`computers_id`,`edge_key`)",
     ] as $idx_sql) {
         try { $DB->doQuery($idx_sql); } catch (\Throwable $e) {}
     }
