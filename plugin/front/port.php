@@ -44,11 +44,12 @@ echo '</div></div></div>';
 $config_url  = Plugin::getWebDir('netstatconnections', true) . '/front/config.php';
 $reltype_url = Plugin::getWebDir('netstatconnections', true) . '/front/relationtype.php';
 $graph_url   = Plugin::getWebDir('netstatconnections', true) . '/front/graph.php';
+$drift_url   = Plugin::getWebDir('netstatconnections', true) . '/front/drift.php';
 
 echo '<div class="container-fluid mb-3">';
 echo '<div class="d-flex justify-content-between align-items-center">';
 
-// Left: Collection Settings + Relation Types + Dependency Map
+// Left: Collection Settings + Relation Types + Dependency Map + Topology Drift
 echo '<div class="d-flex gap-2">';
 echo '<a href="' . htmlspecialchars($config_url) . '" class="btn btn-outline-warning">';
 echo '<i class="ti ti-settings me-1"></i>' . __('Collection Settings', 'netstatconnections') . '</a>';
@@ -56,6 +57,8 @@ echo '<a href="' . htmlspecialchars($reltype_url) . '" class="btn btn-outline-se
 echo '<i class="ti ti-arrow-fork me-1"></i>' . __('Relation Types', 'netstatconnections') . '</a>';
 echo '<a href="' . htmlspecialchars($graph_url) . '" class="btn btn-outline-info" target="_blank">';
 echo '<i class="ti ti-topology-star me-1"></i>' . __('Dependency Map', 'netstatconnections') . '</a>';
+echo '<a href="' . htmlspecialchars($drift_url) . '" class="btn btn-outline-primary">';
+echo '<i class="ti ti-timeline-event me-1"></i>' . __('Topology Drift', 'netstatconnections') . '</a>';
 echo '</div>';
 
 // Right: Add port definition

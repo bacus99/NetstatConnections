@@ -77,11 +77,19 @@ $node_color = [
     'Computer'         => '#1f77b4',   // steel blue
     'Cluster'          => '#ff7f0e',   // orange
     'DatabaseInstance' => '#d62728',   // red
+    'NetworkEquipment' => '#9467bd',   // purple
+    'Printer'          => '#2ca02c',   // green
+    'Phone'            => '#17a2b8',   // teal
+    'Peripheral'       => '#8c564b',   // brown
 ];
 $node_shape = [
     'Computer'         => 'dot',
     'Cluster'          => 'diamond',
     'DatabaseInstance' => 'database',
+    'NetworkEquipment' => 'square',
+    'Printer'          => 'triangle',
+    'Phone'            => 'hexagon',
+    'Peripheral'       => 'star',
 ];
 
 $nodes_raw = [];

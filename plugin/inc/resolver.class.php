@@ -159,6 +159,27 @@ class PluginNetstatconnectionsResolver {
 
         if (empty($ip)) return $default;
 
+        // Built-in GLPI CI types we resolve remote endpoints to. Name-matchable
+        // types are tried in this order (most specific first) for DNS/hint
+        // matches; the same set (minus Cluster, which has no network ports)
+        // gates the glpi_ipaddresses → networkport walk below.
+        //
+        // NOTE: these are GLPI's native asset classes — NOT the GLPI 11 custom
+        // "Asset Definition" framework. Each has its own glpi_<type>s table with
+        // name + is_deleted, and (except Cluster) can own network ports/IPs.
+        static $name_tables = [
+            'Cluster'          => 'glpi_clusters',
+            'Computer'         => 'glpi_computers',
+            'NetworkEquipment' => 'glpi_networkequipments',
+            'Printer'          => 'glpi_printers',
+            'Phone'            => 'glpi_phones',
+            'Peripheral'       => 'glpi_peripherals',
+        ];
+        // itemtypes acceptable as the owner of a resolved IP (via networkport)
+        static $ip_itemtypes = [
+            'Computer', 'NetworkEquipment', 'Printer', 'Phone', 'Peripheral',
+        ];
+
         // 1. Try hostname lookup — stored hint first, then live DNS reverse lookup
         $hostnames = array_filter(array_unique([
             $hint,
@@ -169,38 +190,23 @@ class PluginNetstatconnectionsResolver {
             // Strip domain
             $short = preg_replace('/\..*$/', '', $hostname);
 
-            // Check clusters first
-            $cluster = $DB->request([
-                'SELECT' => ['id'],
-                'FROM'   => 'glpi_clusters',
-                'WHERE'  => ['name' => $short, 'is_deleted' => 0],
-                'LIMIT'  => 1,
-            ])->current();
+            foreach ($name_tables as $itemtype => $table) {
+                if (!$DB->tableExists($table)) continue;
+                $hit = $DB->request([
+                    'SELECT' => ['id'],
+                    'FROM'   => $table,
+                    'WHERE'  => ['name' => $short, 'is_deleted' => 0],
+                    'LIMIT'  => 1,
+                ])->current();
 
-            if ($cluster) {
-                return [
-                    'remote_scope'    => 'internal',
-                    'resolved_via'    => 'dns',
-                    'remote_items_id' => (int)$cluster['id'],
-                    'remote_itemtype' => 'Cluster',
-                ];
-            }
-
-            // Check computers by name
-            $computer = $DB->request([
-                'SELECT' => ['id'],
-                'FROM'   => 'glpi_computers',
-                'WHERE'  => ['name' => $short, 'is_deleted' => 0],
-                'LIMIT'  => 1,
-            ])->current();
-
-            if ($computer) {
-                return [
-                    'remote_scope'    => 'internal',
-                    'resolved_via'    => 'dns',
-                    'remote_items_id' => (int)$computer['id'],
-                    'remote_itemtype' => 'Computer',
-                ];
+                if ($hit) {
+                    return [
+                        'remote_scope'    => 'internal',
+                        'resolved_via'    => 'dns',
+                        'remote_items_id' => (int)$hit['id'],
+                        'remote_itemtype' => $itemtype,
+                    ];
+                }
             }
         }
 
@@ -230,7 +236,7 @@ class PluginNetstatconnectionsResolver {
                         'LIMIT'  => 1,
                     ])->current();
 
-                    if ($np && in_array($np['itemtype'], ['Computer', 'Cluster'])) {
+                    if ($np && in_array($np['itemtype'], $ip_itemtypes, true)) {
                         return [
                             'remote_scope'    => 'internal',
                             'resolved_via'    => 'glpi_ip',

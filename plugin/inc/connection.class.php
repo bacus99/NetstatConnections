@@ -340,6 +340,19 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
         $known_ports = PluginNetstatconnectionsPort::getKnownPortNumbers();
         $ephemeral   = 49152;
 
+        // Database ports (v2.8.2): inbound groups on these ports name the LOCAL
+        // DatabaseInstance in their header — the instance is the local side of
+        // an inbound DB connection, which the remote column can never show.
+        $db_ports = [];
+        foreach ($DB->request([
+            'SELECT' => ['port_number', 'protocol'],
+            'FROM'   => 'glpi_plugin_netstatconnections_ports',
+            'WHERE'  => ['is_database_port' => 1],
+        ]) as $p) {
+            $db_ports[(int)$p['port_number'] . '_' . strtoupper($p['protocol'])] = true;
+        }
+        $local_inst_cache = [];   // svcPort => resolved local instance row|null
+
         // ── Build grouped query ──────────────────────────────────────
         // We use raw SQL with UNION to handle three cases:
         //   1. Outbound to known ports  (remote_port IN known)
@@ -537,7 +550,13 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
 
         // ── Pre-compute inbound groups for bulk-lock headers ─────────
         // Key: direction|protocol|service_port  → total / locked counts
+        // Also derive $cycles_observed = the host's most-observed edge's
+        // seen_count, used as the denominator for the true weight ratio
+        // (v2.9.1). An always-on dependency (DC / monitoring / DNS) is seen
+        // every push, so its seen_count ≈ the number of collection cycles this
+        // host has gone through — i.e. "seen 167 / 168 cycles".
         $group_meta = [];
+        $cycles_observed = 1;
         foreach ($rows as $r) {
             $gk = ($r['direction'] ?? 'out') . '|' . ($r['protocol'] ?? 'TCP') . '|' . (int)($r['service_port'] ?? 0);
             if (!isset($group_meta[$gk])) {
@@ -548,6 +567,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
             }
             $group_meta[$gk]['total']++;
             if ((int)$r['is_locked']) $group_meta[$gk]['locked']++;
+            $cycles_observed = max($cycles_observed, (int)($r['seen_count'] ?? 1));
         }
 
         // Count closed connections for badge
@@ -624,6 +644,24 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                     echo '<td colspan="9" class="py-1 px-3 d-flex align-items-center">';
                     echo '<span class="fw-semibold text-primary me-2">';
                     echo '◀ Inbound ' . PluginNetstatconnectionsPort::getBadge($svcPort, $proto);
+                    // DB port → the clients are consuming the LOCAL DatabaseInstance;
+                    // name it here since the remote column can only show the clients.
+                    if (isset($db_ports[$svcPort . '_' . strtoupper($proto)])
+                        && class_exists('PluginNetstatconnectionsResolver')
+                        && class_exists('DatabaseInstance')) {
+                        if (!array_key_exists($svcPort, $local_inst_cache)) {
+                            $local_inst_cache[$svcPort] = PluginNetstatconnectionsResolver::resolveToInstance(
+                                'Computer', $computers_id, $svcPort
+                            );
+                        }
+                        if ($local_inst_cache[$svcPort]) {
+                            $li = new DatabaseInstance();
+                            if ($li->getFromDB((int)$local_inst_cache[$svcPort]['id'])) {
+                                echo ' <span class="fw-normal">on <a href="' . $li->getLinkURL() . '">'
+                                   . htmlspecialchars($li->getName()) . '</a></span>';
+                            }
+                        }
+                    }
                     echo ' — ' . $g['total'] . ' client' . ($g['total'] > 1 ? 's' : '');
                     echo $lock_summary;
                     echo '</span>';
@@ -760,18 +798,23 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
 
             echo '<td><small class="text-muted">' . $age . '</small></td>';
 
-            // ── Weight / observation-consistency badge (v2.4.0) ───────────
-            // seen_count = how many pushes this edge appeared in. This is the
-            // signal periodic agentless scans can't produce: a "Rare" (seen
-            // once) edge is exactly the transient dependency a snapshot tool
-            // misses. Buckets are heuristic; the raw count + first-seen age in
-            // the tooltip are the honest evidence.
-            $seen = (int)($conn['seen_count'] ?? 1);
-            if      ($seen >= 24) { $w_label = 'Persistent'; $w_class = 'bg-success'; }
-            elseif  ($seen >= 5)  { $w_label = 'Frequent';   $w_class = 'bg-info'; }
-            elseif  ($seen >= 2)  { $w_label = 'Occasional'; $w_class = 'bg-secondary'; }
-            else                  { $w_label = 'Rare';       $w_class = 'bg-warning text-dark'; }
-            $w_title = 'Observed in ' . $seen . ' push' . ($seen === 1 ? '' : 'es');
+            // ── Weight / observation-consistency ratio (v2.9.1) ───────────
+            // True ratio: seen_count ÷ cycles_observed (the host's most-seen
+            // edge ≈ total collection cycles). Self-calibrating across push
+            // frequencies — "seen 167/168 cycles" — and far more honest than the
+            // old absolute buckets. A freshly-appeared edge reads low until it
+            // proves itself over cycles (correct: a new dependency is genuinely
+            // less established). The raw count + first-seen age stay in the
+            // tooltip as evidence.
+            $seen  = (int)($conn['seen_count'] ?? 1);
+            $denom = max($seen, $cycles_observed);            // never > 100%
+            $ratio = $denom > 0 ? ($seen / $denom) : 1.0;
+            $pct   = (int)round($ratio * 100);
+            if      ($ratio >= 0.90) { $w_label = 'Persistent'; $w_class = 'bg-success'; }
+            elseif  ($ratio >= 0.50) { $w_label = 'Frequent';   $w_class = 'bg-info'; }
+            elseif  ($ratio >= 0.15) { $w_label = 'Occasional'; $w_class = 'bg-secondary'; }
+            else                     { $w_label = 'Rare';       $w_class = 'bg-warning text-dark'; }
+            $w_title = 'Seen ' . $seen . ' of ~' . $denom . ' observed cycles (' . $pct . '%)';
             if (!empty($conn['first_seen'])) {
                 $fs = strtotime((string)$conn['first_seen']);
                 if ($fs) {
@@ -782,7 +825,7 @@ class PluginNetstatconnectionsConnection extends CommonDBTM {
                 }
             }
             echo '<td><span class="badge ' . $w_class . '" style="cursor:help;font-size:0.7em" title="'
-                . htmlspecialchars($w_title) . '">' . $seen . '×</span>'
+                . htmlspecialchars($w_title) . '">' . $seen . '/' . $denom . '</span>'
                 . ' <small class="text-muted" style="font-size:0.7em">' . $w_label . '</small></td>';
 
             echo '<td><small class="text-muted">' . (int)($conn['conn_count'] ?? 1) . '</small></td>';

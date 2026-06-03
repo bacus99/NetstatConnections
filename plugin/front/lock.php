@@ -60,7 +60,10 @@ if ($connDir === '' || $connDir === null) {
 }
 
 if ($direction === null) {
-    $direction = ($connDir === 'inbound') ? 'depends' : 'impacts';
+    // Service impacts its consumers: outbound = we consume the remote service
+    // → 'depends' (it impacts us); inbound = remote clients consume OUR
+    // service → 'impacts' (we impact them).
+    $direction = ($connDir === 'inbound') ? 'impacts' : 'depends';
 }
 
 $svcPort = ($connDir === 'inbound')
@@ -136,10 +139,15 @@ if ($locked && $remote_items_id > 0 && $remote_items_id !== $computers_id) {
 
     $impact_target_type = $remote_itemtype;
     $impact_target_id   = $remote_items_id;
+    $local_edge_type    = 'Computer';
+    $local_edge_id      = $computers_id;
     $chain_host_type    = '';
     $chain_host_id      = 0;
+    $chain_instance_id  = 0;
 
-    // Pillar 2: database port → resolve to DatabaseInstance
+    // Pillar 2: database port → route the DATABASE-side endpoint through its
+    // DatabaseInstance. Direction-aware: outbound = the remote hosts the DB;
+    // inbound = the DB lives on THIS computer (the remote is just a client).
     $is_db_port = 0;
     try {
         $port_def = $DB->request([
@@ -151,41 +159,72 @@ if ($locked && $remote_items_id > 0 && $remote_items_id !== $computers_id) {
         $is_db_port = (int)($port_def['is_database_port'] ?? 0);
     } catch (\Throwable $e) {}
 
-    if ($is_db_port && class_exists('PluginNetstatconnectionsResolver')) {
-        $instance = PluginNetstatconnectionsResolver::resolveToInstance(
-            $remote_itemtype, $remote_items_id, $svcPort
-        );
-        if ($instance) {
-            $impact_target_type = 'DatabaseInstance';
-            $impact_target_id   = (int)$instance['id'];
-
-            $chain = PluginNetstatconnectionsResolver::resolveInstanceChain((int)$instance['id']);
+    if ($is_db_port && $connDir !== 'inbound' && class_exists('PluginNetstatconnectionsResolver')) {
+        if ($remote_itemtype === 'DatabaseInstance') {
+            // Already routed to an instance — just recover the host chain.
+            $chain_instance_id = $remote_items_id;
+            $chain = PluginNetstatconnectionsResolver::resolveInstanceChain($remote_items_id);
             if (!empty($chain) && $chain['host_id'] > 0 && !empty($chain['host_type'])) {
                 $chain_host_type = $chain['host_type'];
                 $chain_host_id   = $chain['host_id'];
             }
+        } else {
+            $instance = PluginNetstatconnectionsResolver::resolveToInstance(
+                $remote_itemtype, $remote_items_id, $svcPort
+            );
+            if ($instance) {
+                $impact_target_type = 'DatabaseInstance';
+                $impact_target_id   = (int)$instance['id'];
+                $chain_instance_id  = $impact_target_id;
 
-            try {
-                $DB->update('glpi_plugin_netstatconnections_connections', [
-                    'remote_items_id' => $impact_target_id,
-                    'remote_itemtype' => $impact_target_type,
-                    'resolved_via'    => 'db_instance',
-                ], $where);
-            } catch (\Throwable $e) {
-                $DB->update('glpi_plugin_netstatconnections_connections', [
-                    'remote_items_id' => $impact_target_id,
-                    'remote_itemtype' => $impact_target_type,
-                ], $where);
+                $chain = PluginNetstatconnectionsResolver::resolveInstanceChain((int)$instance['id']);
+                if (!empty($chain) && $chain['host_id'] > 0 && !empty($chain['host_type'])) {
+                    $chain_host_type = $chain['host_type'];
+                    $chain_host_id   = $chain['host_id'];
+                }
+
+                try {
+                    $DB->update('glpi_plugin_netstatconnections_connections', [
+                        'remote_items_id' => $impact_target_id,
+                        'remote_itemtype' => $impact_target_type,
+                        'resolved_via'    => 'db_instance',
+                    ], $where);
+                } catch (\Throwable $e) {
+                    $DB->update('glpi_plugin_netstatconnections_connections', [
+                        'remote_items_id' => $impact_target_id,
+                        'remote_itemtype' => $impact_target_type,
+                    ], $where);
+                }
             }
+        }
+    } elseif ($is_db_port && $connDir === 'inbound' && class_exists('PluginNetstatconnectionsResolver')) {
+        // Inbound: substitute the LOCAL endpoint with the local DatabaseInstance
+        // so client edges attach to the instance, never the bare host.
+        $local_inst = PluginNetstatconnectionsResolver::resolveToInstance(
+            'Computer', $computers_id, $svcPort
+        );
+        if ($local_inst) {
+            $local_edge_type   = 'DatabaseInstance';
+            $local_edge_id     = (int)$local_inst['id'];
+            $chain_instance_id = $local_edge_id;
+            $chain_host_type   = 'Computer';
+            $chain_host_id     = $computers_id;
         }
     }
 
     if ($direction === 'impacts') {
-        $src_type = 'Computer';          $src_id = $computers_id;
+        $src_type = $local_edge_type;    $src_id = $local_edge_id;
         $dst_type = $impact_target_type; $dst_id = $impact_target_id;
     } else {
         $src_type = $impact_target_type; $src_id = $impact_target_id;
-        $dst_type = 'Computer';          $dst_id = $computers_id;
+        $dst_type = $local_edge_type;    $dst_id = $local_edge_id;
+    }
+
+    // When the LOCAL endpoint routed through its instance, drop the legacy
+    // direct host↔client edges so the path collapses through the instance.
+    if ($local_edge_type === 'DatabaseInstance') {
+        _removeImpactRelation('Computer', $computers_id, $impact_target_type, $impact_target_id);
+        _removeImpactRelation($impact_target_type, $impact_target_id, 'Computer', $computers_id);
     }
 
     // Rebuild the name from ALL currently-locked ports to this CI
@@ -198,10 +237,10 @@ if ($locked && $remote_items_id > 0 && $remote_items_id !== $computers_id) {
     _removeImpactRelation($dst_type, $dst_id, $src_type, $src_id);
     _setImpactRelation($src_type, $src_id, $dst_type, $dst_id, $accumulated_name);
 
-    if ($chain_host_id > 0 && !empty($chain_host_type)) {
+    if ($chain_host_id > 0 && !empty($chain_host_type) && $chain_instance_id > 0) {
         _ensureImpactRelation(
             $chain_host_type, $chain_host_id,
-            'DatabaseInstance', $impact_target_id,
+            'DatabaseInstance', $chain_instance_id,
             $port_label . ' (host)'
         );
     }
@@ -218,6 +257,14 @@ if ($locked && $remote_items_id > 0 && $remote_items_id !== $computers_id) {
         _removeImpactRelation($eff_type, $remote_items_id, 'Computer', $computers_id);
         _removeImpactRelation('Computer', $computers_id, 'DatabaseInstance', $remote_items_id);
         _removeImpactRelation('DatabaseInstance', $remote_items_id, 'Computer', $computers_id);
+        // Also clean inbound instance-routed edges (local DatabaseInstance ↔ client)
+        if (class_exists('PluginNetstatconnectionsResolver')) {
+            $li = PluginNetstatconnectionsResolver::resolveToInstance('Computer', $computers_id, $svcPort);
+            if ($li) {
+                _removeImpactRelation('DatabaseInstance', (int)$li['id'], $eff_type, $remote_items_id);
+                _removeImpactRelation($eff_type, $remote_items_id, 'DatabaseInstance', (int)$li['id']);
+            }
+        }
     } else {
         // Other ports still locked — update name on whichever direction exists
         _updateImpactName('Computer', $computers_id, $eff_type, $remote_items_id, $new_name);

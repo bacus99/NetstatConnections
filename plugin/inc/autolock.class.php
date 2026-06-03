@@ -50,26 +50,63 @@ class PluginNetstatconnectionsAutolock {
      * Cron sweep — process all unlocked active rows across all computers.
      */
     public static function cronSweep(): int {
-        $policies = self::getPolicies();
-        if (empty($policies)) return 0;
-
         global $DB;
 
-        $iter = $DB->request([
-            'FROM'  => 'glpi_plugin_netstatconnections_connections',
-            'WHERE' => [
-                'is_locked'         => 0,
-                'connection_status' => 'active',
-                ['NOT' => ['remote_addr' => '']],
-            ],
-            'LIMIT' => 2000,
-        ]);
+        $locked   = 0;
+        $policies = self::getPolicies();
 
-        $locked = 0;
-        foreach ($iter as $row) {
-            $result = self::matchPolicy($row, $policies);
-            if (!$result) continue;
-            $locked += self::applyPolicy($row, $result['policy'], (int)$row['computers_id'], $result['is_inbound']);
+        if (!empty($policies)) {
+            $iter = $DB->request([
+                'FROM'  => 'glpi_plugin_netstatconnections_connections',
+                'WHERE' => [
+                    'is_locked'         => 0,
+                    'connection_status' => 'active',
+                    ['NOT' => ['remote_addr' => '']],
+                ],
+                'LIMIT' => 2000,
+            ]);
+
+            foreach ($iter as $row) {
+                $result = self::matchPolicy($row, $policies);
+                if (!$result) continue;
+                $locked += self::applyPolicy($row, $result['policy'], (int)$row['computers_id'], $result['is_inbound']);
+            }
+        }
+
+        // ── Self-heal pass (v2.8.2): re-run relation building on LOCKED rows
+        // of DATABASE ports. Locked rows are never reprocessed by the main
+        // sweep, so rows locked before instance routing / the 2.8.1 semantics
+        // fix keep stale direct Computer↔Computer relations forever. Re-running
+        // applyPolicy on them is idempotent and:
+        //   - upgrades outbound DB-port targets to the DatabaseInstance,
+        //   - routes inbound DB-port locals through the local instance,
+        //   - rebuilds arrows under the corrected direction semantics,
+        //   - removes the legacy direct host↔client edges.
+        // Uses ALL database ports (not just auto_lock=1) so manually-locked
+        // rows heal too.
+        $db_policies = [];
+        foreach ($DB->request([
+            'FROM'  => 'glpi_plugin_netstatconnections_ports',
+            'WHERE' => ['is_database_port' => 1],
+        ]) as $p) {
+            $db_policies[(int)$p['port_number'] . '_' . strtoupper($p['protocol'])] = $p;
+        }
+
+        if (!empty($db_policies)) {
+            $iter = $DB->request([
+                'FROM'  => 'glpi_plugin_netstatconnections_connections',
+                'WHERE' => [
+                    'is_locked'         => 1,
+                    'connection_status' => 'active',
+                    ['NOT' => ['remote_addr' => '']],
+                ],
+                'LIMIT' => 1000,
+            ]);
+            foreach ($iter as $row) {
+                $result = self::matchPolicy($row, $db_policies);
+                if (!$result) continue;
+                self::applyPolicy($row, $result['policy'], (int)$row['computers_id'], $result['is_inbound']);
+            }
         }
 
         return $locked;
@@ -111,11 +148,17 @@ class PluginNetstatconnectionsAutolock {
     private static function applyPolicy(array $row, array $policy, int $computers_id, bool $is_inbound): int {
         global $DB;
 
-        // Inbound → they depend on us (if our service goes down, they break)
-        // Outbound → we depend on them (use policy direction, default 'impacts')
-        $direction = $is_inbound
-            ? 'depends'
-            : ($policy['auto_direction'] ?? 'impacts');
+        // Default assignment — the SERVICE impacts its CONSUMERS:
+        //   Outbound (we consume a remote service, e.g. SCOM → SQL) → 'depends'
+        //     (we depend on the destination; if it dies, we break),
+        //     overridable per-port via auto_direction.
+        //   Inbound (remote clients consume OUR service) → 'impacts'
+        //     (they depend on us; if we die, they break).
+        // A direction already stored on the row (manual toggle / enricher) is
+        // STICKY — the hourly self-heal pass must not revert admin choices.
+        $direction = ($row['impact_direction'] ?? '') ?: ($is_inbound
+            ? 'impacts'
+            : ($policy['auto_direction'] ?? 'depends'));
 
         $conn_direction = $is_inbound ? 'inbound' : 'outbound';
         $svcport = $is_inbound ? (int)($row['local_port'] ?? 0) : (int)($row['remote_port'] ?? 0);
@@ -201,22 +244,43 @@ class PluginNetstatconnectionsAutolock {
             $proto = $row['protocol'] ?? 'TCP';
             $label = self::getPortLabel($svcport, $proto);
 
-            // ── Pillar 2: DatabaseInstance resolution ────────────────
-            // If this is a database port, try to resolve to a DatabaseInstance
+            // ── Pillar 2: DatabaseInstance resolution (direction-aware) ──
+            // The DATABASE side of a DB-port connection is:
+            //   outbound → the REMOTE host (we consume a remote DB)
+            //   inbound  → the LOCAL computer (remote clients consume OUR DB)
+            // Route the database-side endpoint through its DatabaseInstance so
+            // 1433-style edges attach to the instance, never the bare host.
             $is_db_port = (int)($policy['is_database_port'] ?? 0);
             $impact_target_type = $remote_type;
             $impact_target_id   = $remote_id;
+            $local_edge_type    = 'Computer';
+            $local_edge_id      = $computers_id;
             $chain_host_type    = '';
             $chain_host_id      = 0;
+            $chain_instance_id  = 0;
 
-            if ($is_db_port && class_exists('PluginNetstatconnectionsResolver')) {
+            if ($is_db_port && !$is_inbound && $remote_type === 'DatabaseInstance'
+                && class_exists('PluginNetstatconnectionsResolver')) {
+                // Remote is ALREADY an instance (row locked/healed earlier).
+                // Recover its host chain so cluster routing (Pillar 3.5) and the
+                // host edge are preserved when this row is reprocessed by the
+                // self-heal pass — without this, re-running would rebuild a
+                // direct Source↔DBI edge and undo the AlwaysOn routing.
+                $chain_instance_id = $remote_id;
+                $chain = PluginNetstatconnectionsResolver::resolveInstanceChain($remote_id);
+                if (!empty($chain) && $chain['host_id'] > 0 && !empty($chain['host_type'])) {
+                    $chain_host_type = $chain['host_type'];
+                    $chain_host_id   = $chain['host_id'];
+                }
+            } elseif ($is_db_port && !$is_inbound && class_exists('PluginNetstatconnectionsResolver')) {
+                // Outbound: upgrade the REMOTE target to its DatabaseInstance
                 $instance = PluginNetstatconnectionsResolver::resolveToInstance(
                     $remote_type, $remote_id, $svcport
                 );
                 if ($instance) {
-                    // Target the DatabaseInstance instead of the Computer/Cluster
                     $impact_target_type = 'DatabaseInstance';
                     $impact_target_id   = (int)$instance['id'];
+                    $chain_instance_id  = $impact_target_id;
 
                     // Pillar 3: chain DatabaseInstance → host (Computer or Cluster)
                     $chain = PluginNetstatconnectionsResolver::resolveInstanceChain((int)$instance['id']);
@@ -238,6 +302,20 @@ class PluginNetstatconnectionsAutolock {
                             'remote_itemtype' => $impact_target_type,
                         ], ['id' => (int)$row['id']]);
                     }
+                }
+            } elseif ($is_db_port && $is_inbound && class_exists('PluginNetstatconnectionsResolver')) {
+                // Inbound: the database lives HERE — substitute the LOCAL endpoint
+                // with the local DatabaseInstance (the remote is just a client; it
+                // has no instance). Host chain: this Computer → the instance.
+                $local_inst = PluginNetstatconnectionsResolver::resolveToInstance(
+                    'Computer', $computers_id, $svcport
+                );
+                if ($local_inst) {
+                    $local_edge_type   = 'DatabaseInstance';
+                    $local_edge_id     = (int)$local_inst['id'];
+                    $chain_instance_id = $local_edge_id;
+                    $chain_host_type   = 'Computer';
+                    $chain_host_id     = $computers_id;
                 }
             }
 
@@ -263,14 +341,19 @@ class PluginNetstatconnectionsAutolock {
                 $client_edge_id   = $impact_target_id;
             }
 
+            // Canonical direction semantics (MUST match lock.php + graph.php):
+            //   'impacts' → this computer IMPACTS the remote  (relation Computer → remote)
+            //   'depends' → the remote impacts this computer  (relation remote → Computer)
+            // i.e. the impact arrow points from the SERVICE to its CONSUMER:
+            // SCORMON01 ▶ SQL01 (outbound, depends) ⇒ SQL01 → impacts → SCORMON01.
+            // (Pre-2.8.1 autolock had the mapping inverted relative to manual
+            // locks, producing opposite arrows depending on how a row got locked.)
             if ($direction === 'impacts') {
-                // Remote impacts us (if remote goes down, we break)
-                $src_type = $client_edge_type; $src_id = $client_edge_id;
-                $dst_type = 'Computer';        $dst_id = $computers_id;
-            } else {
-                // We impact them (they depend on us)
-                $src_type = 'Computer';        $src_id = $computers_id;
+                $src_type = $local_edge_type;  $src_id = $local_edge_id;
                 $dst_type = $client_edge_type; $dst_id = $client_edge_id;
+            } else {
+                $src_type = $client_edge_type; $src_id = $client_edge_id;
+                $dst_type = $local_edge_type;  $dst_id = $local_edge_id;
             }
 
             // Build accumulated name from ALL currently-locked connections to this CI.
@@ -294,16 +377,24 @@ class PluginNetstatconnectionsAutolock {
                 self::removeImpactRelation('Computer', $computers_id, 'DatabaseInstance', $impact_target_id);
             }
 
+            // When the LOCAL endpoint routed through its DatabaseInstance
+            // (inbound DB port), clean up the legacy direct host↔client edges
+            // so the path collapses to Client ← Instance ← Host.
+            if ($local_edge_type === 'DatabaseInstance') {
+                self::removeImpactRelation('Computer', $computers_id, $client_edge_type, $client_edge_id);
+                self::removeImpactRelation($client_edge_type, $client_edge_id, 'Computer', $computers_id);
+            }
+
             self::ensureImpactItem($src_type, $src_id);
             self::ensureImpactItem($dst_type, $dst_id);
             self::setImpactRelation($src_type, $src_id, $dst_type, $dst_id, $accumulated_label);
 
             // ── Pillar 3: Host → DatabaseInstance (host failure takes down the instance)
-            if ($chain_host_id > 0 && !empty($chain_host_type)) {
+            if ($chain_host_id > 0 && !empty($chain_host_type) && $chain_instance_id > 0) {
                 self::ensureImpactItem($chain_host_type, $chain_host_id);
                 self::ensureImpactRelation(
                     $chain_host_type, $chain_host_id,
-                    'DatabaseInstance', $impact_target_id,
+                    'DatabaseInstance', $chain_instance_id,
                     $label . ' (host)'
                 );
             }

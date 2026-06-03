@@ -4,7 +4,8 @@
  *
  * Pillar 7 — Cron housekeeping
  *
- * Five scheduled tasks:
+ * Six scheduled tasks (NetstatResolveAll, NetstatAutoLock, NetstatEnrich,
+ * NetstatLifecycle, NetstatCleanup, NetstatDrift):
  *
  *   NetstatLifecycle  (hourly) — Transition active → closed for connections whose
  *                                last_seen is older than param hours (default 72).
@@ -59,6 +60,9 @@ class PluginNetstatconnectionsCrontask {
 
     /** @var int Threshold for stale-agent detection (days without any push) */
     const STALE_AGENT_DAYS = 7;
+
+    /** @var int Default retention for drift events (days; 0 = keep forever) */
+    const DRIFT_RETENTION_DAYS = 90;
 
     public static function registerCronTasks(): void {
         $cron = new CronTask();
@@ -127,11 +131,24 @@ class PluginNetstatconnectionsCrontask {
                 ]
             );
         }
+
+        if (!$cron->getFromDBbyName('PluginNetstatconnectionsCrontask', 'NetstatDrift')) {
+            CronTask::register(
+                'PluginNetstatconnectionsCrontask',
+                'NetstatDrift',
+                3600, // hourly
+                [
+                    'mode'  => CronTask::MODE_INTERNAL,
+                    'state' => CronTask::STATE_WAITING,
+                    'param' => self::DRIFT_RETENTION_DAYS,
+                ]
+            );
+        }
     }
 
     public static function unregisterCronTasks(): void {
         $cron = new CronTask();
-        foreach (['NetstatResolveAll', 'NetstatAutoLock', 'NetstatEnrich', 'NetstatLifecycle', 'NetstatCleanup'] as $name) {
+        foreach (['NetstatResolveAll', 'NetstatAutoLock', 'NetstatEnrich', 'NetstatLifecycle', 'NetstatCleanup', 'NetstatDrift'] as $name) {
             if ($cron->getFromDBbyName('PluginNetstatconnectionsCrontask', $name)) {
                 $cron->delete(['id' => $cron->getID()]);
             }
@@ -166,6 +183,26 @@ class PluginNetstatconnectionsCrontask {
         $enriched = PluginNetstatconnectionsEnricher::cronSweep();
         $task->addVolume($enriched);
         return ($enriched > 0) ? 1 : 0;
+    }
+
+    /**
+     * Cron: Topology drift detection. Records 'appeared' / 'disappeared' events
+     * since the last run, then purges drift events older than param days.
+     * param = drift-event retention in days (0 = keep forever).
+     *
+     * Should run AFTER NetstatLifecycle (which stamps closed_at) so disappearances
+     * are detected in the same cycle they're marked closed.
+     */
+    public static function cronNetstatDrift(CronTask $task): int {
+        $logged = PluginNetstatconnectionsDrift::detect();
+
+        $days = (int)($task->fields['param'] ?? self::DRIFT_RETENTION_DAYS);
+        if ($days > 0) {
+            PluginNetstatconnectionsDrift::purgeOld($days);
+        }
+
+        $task->addVolume($logged);
+        return ($logged > 0) ? 1 : 0;
     }
 
     /**
@@ -219,10 +256,13 @@ class PluginNetstatconnectionsCrontask {
         }
 
         if (!empty($ids)) {
-            // Batch update in chunks of 1000 to avoid huge IN clauses
+            // Batch update in chunks of 1000 to avoid huge IN clauses.
+            // Stamp closed_at = NOW() so drift detection can find "disappeared
+            // since last run" (only stamp rows not already carrying a closed_at).
             foreach (array_chunk($ids, 1000) as $chunk) {
                 $DB->update($table, [
                     'connection_status' => 'closed',
+                    'closed_at'         => new \Glpi\DBAL\QueryExpression('NOW()'),
                 ], [
                     'id' => $chunk,
                 ]);
@@ -256,6 +296,7 @@ class PluginNetstatconnectionsCrontask {
             foreach ($stale_ids as $cid) {
                 $DB->update($table, [
                     'connection_status' => 'closed',
+                    'closed_at'         => new \Glpi\DBAL\QueryExpression('NOW()'),
                 ], [
                     'computers_id'      => $cid,
                     'connection_status' => 'active',
@@ -327,6 +368,12 @@ class PluginNetstatconnectionsCrontask {
             case 'NetstatEnrich':
                 return [
                     'description' => __('Soft enrichment: populate service_port / conn_direction / impact_direction on unlocked rows from port definitions (drives dependency map fill-in)', 'netstatconnections'),
+                ];
+
+            case 'NetstatDrift':
+                return [
+                    'description' => __('Topology drift: log when CI-to-CI dependencies appear or disappear, building a change history', 'netstatconnections'),
+                    'parameter'   => __('Drift-event retention in days (0 = keep forever)', 'netstatconnections'),
                 ];
 
             case 'NetstatLifecycle':

@@ -31,7 +31,7 @@
  *     are auto-fetched by agents.
  */
 
-define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.5.0');
+define('PLUGIN_NETSTATCONNECTIONS_VERSION', '2.9.1');
 define('PLUGIN_NETSTATCONNECTIONS_MIN_GLPI', '11.0.0');
 define('PLUGIN_NETSTATCONNECTIONS_MAX_GLPI', '12.0.0');
 
@@ -63,6 +63,10 @@ function plugin_init_netstatconnections(): void {
     // Relation Types dropdown — backed by inc/relationtype.class.php +
     // front/relationtype.php + relationtype.form.php (v2.5.0).
     Plugin::registerClass('PluginNetstatconnectionsRelationtype');
+    // Application/business-service grouping reuses GLPI's native Appliance.
+    // We only add a "Network Dependencies" tab that derives depends-on/used-by
+    // from the appliance's members' observed traffic (v2.8.0).
+    Plugin::registerClass('PluginNetstatconnectionsAppliancedeps', ['addtabon' => ['Appliance']]);
 
     // Config page link
     $PLUGIN_HOOKS['config_page']['netstatconnections'] = 'front/port.php';

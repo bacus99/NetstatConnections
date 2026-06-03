@@ -104,24 +104,30 @@ class PluginNetstatconnectionsEnricher {
     public static function classify(int $rport, int $lport, string $proto, array $policies): ?array {
         $proto = strtoupper($proto);
 
-        // Strategy 1: remote_port matches a known port → outbound
+        // Canonical semantics: 'impacts' = this computer impacts the remote;
+        // 'depends' = the remote impacts this computer (we depend on it).
+        // The service impacts its consumers.
+
+        // Strategy 1: remote_port matches a known port → outbound — we consume
+        // the remote service, so default 'depends' (it impacts us).
         $key = $rport . '_' . $proto;
         if ($rport > 0 && isset($policies[$key])) {
             $policy = $policies[$key];
             return [
                 'service_port'     => $rport,
                 'conn_direction'   => 'outbound',
-                'impact_direction' => $policy['auto_direction'] ?? 'impacts',
+                'impact_direction' => $policy['auto_direction'] ?? 'depends',
             ];
         }
 
-        // Strategy 2: local_port matches a known port AND remote is ephemeral → inbound
+        // Strategy 2: local_port matches a known port AND remote is ephemeral → inbound —
+        // remote clients consume OUR service → 'impacts' (they depend on us).
         $key = $lport . '_' . $proto;
         if ($lport > 0 && isset($policies[$key]) && self::looksLikeInbound($rport, $lport)) {
             return [
                 'service_port'     => $lport,
                 'conn_direction'   => 'inbound',
-                'impact_direction' => 'depends', // they depend on us
+                'impact_direction' => 'impacts',
             ];
         }
 

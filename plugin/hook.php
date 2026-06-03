@@ -55,6 +55,13 @@ function plugin_netstatconnections_install(): bool {
             `collected_at`      TIMESTAMP    NULL DEFAULT NULL,
             `last_seen`         TIMESTAMP    NULL DEFAULT NULL,
             `connection_status` ENUM('active','closed') NOT NULL DEFAULT 'active',
+            -- closed_at: set when the lifecycle cron flips this edge to closed;
+            -- drives drift disappearance detection. Cleared on reactivation by
+            -- push.php. NULL while active.
+            `closed_at`         TIMESTAMP    NULL DEFAULT NULL,
+            -- reopened_at: set when push.php reactivates a previously-closed
+            -- edge (closed -> active). Drives drift reappearance detection.
+            `reopened_at`       TIMESTAMP    NULL DEFAULT NULL,
             -- created_at: always a real, valid TIMESTAMP. NULL and zero-date are
             -- both type-invalid (MySQL TIMESTAMP range is 1970-01-01..2038-01-19),
             -- so we use NOT NULL DEFAULT CURRENT_TIMESTAMP. push.php always passes
@@ -109,6 +116,8 @@ function plugin_netstatconnections_install(): bool {
         'last_seen'         => "TIMESTAMP NULL DEFAULT NULL AFTER `collected_at`",
         'connection_status' => "ENUM('active','closed') NOT NULL DEFAULT 'active' AFTER `last_seen`",
         'created_at'        => "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP AFTER `connection_status`",
+        'closed_at'         => "TIMESTAMP NULL DEFAULT NULL AFTER `connection_status`",
+        'reopened_at'       => "TIMESTAMP NULL DEFAULT NULL AFTER `closed_at`",
         'remote_items_id'   => "INT UNSIGNED DEFAULT NULL AFTER `impact_direction`",
         'remote_itemtype'   => "VARCHAR(100) DEFAULT NULL AFTER `remote_items_id`",
         'remote_scope'      => "VARCHAR(20) DEFAULT NULL AFTER `remote_itemtype`",
@@ -390,9 +399,9 @@ function plugin_netstatconnections_install(): bool {
             `port_number`      SMALLINT UNSIGNED NOT NULL DEFAULT 0,
             `protocol`         VARCHAR(10)  NOT NULL DEFAULT 'TCP',
             `color`            VARCHAR(10)  NOT NULL DEFAULT '#6c757d',
-            `direction`        ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
+            `direction`        ENUM('impacts','depends') NOT NULL DEFAULT 'depends',
             `auto_lock`        TINYINT UNSIGNED NOT NULL DEFAULT 0,
-            `auto_direction`   ENUM('impacts','depends') NOT NULL DEFAULT 'impacts',
+            `auto_direction`   ENUM('impacts','depends') NOT NULL DEFAULT 'depends',
             `is_database_port` TINYINT UNSIGNED NOT NULL DEFAULT 0,
             `relation_types_id` INT UNSIGNED DEFAULT NULL,
             `comment`          TEXT         DEFAULT NULL,
@@ -427,13 +436,26 @@ function plugin_netstatconnections_install(): bool {
             [8080, 'HTTP-Alt',   'TCP', '#6f42c1'],
             [8403, 'SCOM-GW',    'TCP', '#6c757d'],
             [10123,'SCOM-Web',   'TCP', '#6c757d'],
+            // Printer + network-device service ports (map to Printer / NetworkEquipment CIs)
+            [9100, 'JetDirect',  'TCP', '#2ca02c'],
+            [515,  'LPD',        'TCP', '#2ca02c'],
+            [631,  'IPP',        'TCP', '#2ca02c'],
+            [161,  'SNMP',       'UDP', '#9467bd'],
+            [162,  'SNMP-Trap',  'UDP', '#9467bd'],
+            // Active Directory suite (Global Catalog + LDAPS + Kerberos)
+            [3268, 'GC-LDAP',    'TCP', '#20c997'],
+            [3269, 'GC-LDAPS',   'TCP', '#20c997'],
+            [636,  'LDAPS',      'TCP', '#20c997'],
+            [88,   'Kerberos',   'TCP', '#20c997'],
         ] as [$port, $name, $proto, $color]) {
             $DB->insert('glpi_plugin_netstatconnections_ports', [
                 'name'        => $name,
                 'port_number' => $port,
                 'protocol'    => $proto,
                 'color'       => $color,
-                'direction'   => 'impacts',
+                // Outbound to a service port means the connector DEPENDS on it
+                // (the service impacts its consumers) — see v2.8.1 semantics.
+                'direction'   => 'depends',
                 'auto_lock'   => 0,
             ]);
         }
@@ -442,7 +464,7 @@ function plugin_netstatconnections_install(): bool {
     // Upgrade ports table: add columns if missing
     foreach ([
         'auto_lock'          => "TINYINT UNSIGNED NOT NULL DEFAULT 0",
-        'auto_direction'     => "ENUM('impacts','depends') NOT NULL DEFAULT 'impacts'",
+        'auto_direction'     => "ENUM('impacts','depends') NOT NULL DEFAULT 'depends'",
         'is_database_port'   => "TINYINT UNSIGNED NOT NULL DEFAULT 0",
         'relation_types_id'  => "INT UNSIGNED DEFAULT NULL",
     ] as $col => $def) {
@@ -451,10 +473,80 @@ function plugin_netstatconnections_install(): bool {
         }
     }
 
+    // ── One-time direction-semantics migration (v2.8.1) ───────────────────
+    // Canonical semantics: 'impacts' = computer impacts the remote;
+    // 'depends' = remote impacts the computer. Defaults: outbound = 'depends'
+    // (we consume the remote service), inbound = 'impacts' (clients consume ours).
+    // Pre-2.8.1 assignments were inverted, so flip stored values ONCE:
+    //   - port auto_direction/direction: impacts → depends (service ports are
+    //     things connectors depend on)
+    //   - connection impact_direction: swap impacts ↔ depends
+    // Guarded by a config marker — re-running upgrades must NOT re-flip values
+    // admins have since chosen deliberately.
+    $sem_flag = $DB->request([
+        'FROM'  => 'glpi_plugin_netstatconnections_config',
+        'WHERE' => ['key' => 'direction_semantics_281'],
+        'LIMIT' => 1,
+    ])->current();
+    if (!$sem_flag) {
+        try {
+            $DB->doQuery("UPDATE `glpi_plugin_netstatconnections_ports`
+                SET `auto_direction` = 'depends' WHERE `auto_direction` = 'impacts'");
+            $DB->doQuery("UPDATE `glpi_plugin_netstatconnections_ports`
+                SET `direction` = 'depends' WHERE `direction` = 'impacts'");
+            $DB->doQuery("UPDATE `glpi_plugin_netstatconnections_connections`
+                SET `impact_direction` = CASE `impact_direction`
+                    WHEN 'impacts' THEN 'depends'
+                    WHEN 'depends' THEN 'impacts'
+                    ELSE `impact_direction` END
+                WHERE `impact_direction` IS NOT NULL");
+        } catch (\Throwable $e) { /* best effort */ }
+        $DB->insert('glpi_plugin_netstatconnections_config', [
+            'key'   => 'direction_semantics_281',
+            'value' => 'done',
+        ]);
+    }
+
     // Seed is_database_port = 1 for known DB ports (safe to re-run)
     $DB->doQuery("UPDATE `glpi_plugin_netstatconnections_ports`
         SET `is_database_port` = 1
         WHERE `port_number` IN (1433,1521,3306,5432,5022) AND `protocol` = 'TCP'");
+
+    // Idempotent (v2.6.0): ensure printer/network-device port labels exist on
+    // UPGRADES too — the seed list above only runs on fresh install. These let
+    // connections to printers (9100/515/631) and SNMP-managed network gear
+    // (161/162) carry a proper label/colour when the resolver maps them to
+    // Printer / NetworkEquipment CIs. Check-then-insert = safe on any schema state.
+    foreach ([
+        [9100, 'JetDirect', 'TCP', '#2ca02c'],
+        [515,  'LPD',       'TCP', '#2ca02c'],
+        [631,  'IPP',       'TCP', '#2ca02c'],
+        [161,  'SNMP',      'UDP', '#9467bd'],
+        [162,  'SNMP-Trap', 'UDP', '#9467bd'],
+        // AD suite (v2.8.1) — without these, inbound GC/LDAPS/Kerberos traffic on
+        // DCs is invisible in the Connections tab: the unknown-port fallback
+        // branch only covers OUTBOUND unknowns (client port is ephemeral).
+        [3268, 'GC-LDAP',   'TCP', '#20c997'],
+        [3269, 'GC-LDAPS',  'TCP', '#20c997'],
+        [636,  'LDAPS',     'TCP', '#20c997'],
+        [88,   'Kerberos',  'TCP', '#20c997'],
+    ] as [$p, $n, $pr, $col]) {
+        $exists = $DB->request([
+            'FROM'  => 'glpi_plugin_netstatconnections_ports',
+            'WHERE' => ['port_number' => $p, 'protocol' => $pr],
+            'LIMIT' => 1,
+        ])->current();
+        if (!$exists) {
+            $DB->insert('glpi_plugin_netstatconnections_ports', [
+                'name'        => $n,
+                'port_number' => $p,
+                'protocol'    => $pr,
+                'color'       => $col,
+                'direction'   => 'depends',
+                'auto_lock'   => 0,
+            ]);
+        }
+    }
 
     // Auto-assign relation types to seeded ports (only where NULL — safe to re-run)
     if ($DB->tableExists('glpi_plugin_netstatconnections_relationtypes')) {
@@ -470,6 +562,10 @@ function plugin_netstatconnections_install(): bool {
             [5432,  'TCP', 'Database'],
             [5022,  'TCP', 'Replicates'],
             [389,   'TCP', 'Authenticates'],
+            [3268,  'TCP', 'Authenticates'],
+            [3269,  'TCP', 'Authenticates'],
+            [636,   'TCP', 'Authenticates'],
+            [88,    'TCP', 'Authenticates'],
             [22,    'TCP', 'Administers'],
             [3389,  'TCP', 'Administers'],
             [5985,  'TCP', 'Administers'],
@@ -499,6 +595,49 @@ function plugin_netstatconnections_install(): bool {
         }
     }
 
+    // ── Drift event log (v2.7.0) ──────────────────────────────────────
+    // Persistent record of topology changes (a dependency appeared / vanished).
+    // Identity fields are SNAPSHOTTED here so a drift event survives even after
+    // the originating connection row is purged by the cleanup cron.
+    if (!$DB->tableExists('glpi_plugin_netstatconnections_drift')) {
+        $DB->doQuery("CREATE TABLE `glpi_plugin_netstatconnections_drift` (
+            `id`              INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `computers_id`    INT UNSIGNED NOT NULL DEFAULT 0,
+            `edge_key`        CHAR(40)     DEFAULT NULL,
+            `event_type`      ENUM('appeared','disappeared','reappeared') NOT NULL DEFAULT 'appeared',
+            `protocol`        VARCHAR(10)  NOT NULL DEFAULT '',
+            `service_port`    SMALLINT UNSIGNED DEFAULT NULL,
+            `conn_direction`  VARCHAR(10)  DEFAULT NULL,
+            `remote_addr`     VARCHAR(50)  NOT NULL DEFAULT '',
+            `remote_hostname` VARCHAR(255) DEFAULT NULL,
+            `remote_itemtype` VARCHAR(100) DEFAULT NULL,
+            `remote_items_id` INT UNSIGNED DEFAULT NULL,
+            `process_name`    VARCHAR(255) NOT NULL DEFAULT '',
+            `detected_at`     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `is_acknowledged` TINYINT UNSIGNED NOT NULL DEFAULT 0,
+            PRIMARY KEY (`id`),
+            KEY `computers_id`    (`computers_id`),
+            KEY `detected_at`     (`detected_at`),
+            KEY `event_type`      (`event_type`),
+            KEY `is_acknowledged` (`is_acknowledged`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
+    } else {
+        // v2.9.0: widen event_type ENUM to include 'reappeared' on existing installs.
+        try {
+            $res = $DB->doQuery("SHOW COLUMNS FROM `glpi_plugin_netstatconnections_drift` WHERE Field = 'event_type'");
+            $ci  = $DB->fetchAssoc($res);
+            if ($ci && strpos($ci['Type'], 'reappeared') === false) {
+                $DB->doQuery("ALTER TABLE `glpi_plugin_netstatconnections_drift`
+                    MODIFY `event_type` ENUM('appeared','disappeared','reappeared') NOT NULL DEFAULT 'appeared'");
+            }
+        } catch (\Throwable $e) { /* ignore */ }
+    }
+
+    // Application/business-service grouping reuses GLPI's native Appliance
+    // (glpi_appliances / glpi_appliances_items) — no custom grouping table.
+    // The "Network Dependencies" tab on each Appliance derives depends-on /
+    // used-by from member CI edges at read time (PluginNetstatconnectionsAppliancedeps).
+
     // ── Cron tasks (registered once) ─────────────────────────────────
     PluginNetstatconnectionsCrontask::registerCronTasks();
 
@@ -512,6 +651,7 @@ function plugin_netstatconnections_uninstall(): bool {
         'glpi_plugin_netstatconnections_connections',
         'glpi_plugin_netstatconnections_ports',
         'glpi_plugin_netstatconnections_relationtypes',
+        'glpi_plugin_netstatconnections_drift',
         'glpi_plugin_netstatconnections_config',
     ] as $table) {
         if ($DB->tableExists($table)) {

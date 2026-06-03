@@ -317,8 +317,14 @@ try {
     // UPDATE an existing edge — bump observation counters + refresh volatile fields.
     // Never touches: is_locked, impact_direction, first_seen, created_at,
     // remote_items_id, remote_itemtype, remote_scope, resolved_via, resolved_at.
+    // reopened_at is stamped FIRST so its IF() reads the PRE-update
+    // connection_status: a closed→active transition (a dependency coming back)
+    // gets NOW(); a normal push of an already-active edge keeps the old value.
+    // MySQL evaluates SET assignments left-to-right and later refs see earlier
+    // assignments, so this MUST precede `connection_status = 'active'`.
     $upd = $pdo->prepare("UPDATE glpi_plugin_netstatconnections_connections
-        SET last_seen = ?, collected_at = ?, connection_status = 'active',
+        SET reopened_at = IF(connection_status = 'closed', NOW(), reopened_at),
+            last_seen = ?, collected_at = ?, connection_status = 'active', closed_at = NULL,
             seen_count = seen_count + 1, conn_count = ?,
             state = ?, remote_hostname = ?, local_addr = ?, local_port = ?,
             remote_port = ?, service_name = ?, collection_method = ?,

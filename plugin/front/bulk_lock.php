@@ -71,9 +71,33 @@ if (empty($by_remote)) {
 $count_processed = 0;
 $count_skipped   = 0;
 
-// ── Inbound direction: the remote client depends on this local server ──
-// Impact relation: remote_itemtype/remote_id → Computer/$computers_id
-$direction = 'depends';
+// ── Inbound: remote clients consume OUR service → they depend on us, so
+// this computer IMPACTS them (canonical: 'impacts' = Computer → remote).
+// Impact relation: Computer/$computers_id → remote_itemtype/remote_id
+$direction = 'impacts';
+
+// DB-port inbound: the database lives HERE — route the LOCAL endpoint through
+// the local DatabaseInstance so client edges attach to the instance, never the
+// bare host. Resolved once (same local port for every row in this bulk op).
+$local_edge_type = 'Computer';
+$local_edge_id   = $computers_id;
+$chain_needed    = false;
+try {
+    $pd = $DB->request([
+        'SELECT' => ['is_database_port'],
+        'FROM'   => 'glpi_plugin_netstatconnections_ports',
+        'WHERE'  => ['port_number' => $local_port, 'protocol' => $protocol],
+        'LIMIT'  => 1,
+    ])->current();
+    if ((int)($pd['is_database_port'] ?? 0) === 1 && class_exists('PluginNetstatconnectionsResolver')) {
+        $li = PluginNetstatconnectionsResolver::resolveToInstance('Computer', $computers_id, $local_port);
+        if ($li) {
+            $local_edge_type = 'DatabaseInstance';
+            $local_edge_id   = (int)$li['id'];
+            $chain_needed    = true;
+        }
+    }
+} catch (\Throwable $e) {}
 
 foreach ($by_remote as $remote_addr => $conn) {
 
@@ -133,13 +157,19 @@ foreach ($by_remote as $remote_addr => $conn) {
         }
 
         if ($remote_items_id > 0 && $remote_items_id !== $computers_id && !empty($remote_itemtype)) {
-            // inbound: remote client depends on local server (src=remote, dst=Computer)
+            // Inbound: this server's service impacts its clients
+            // (canonical 'impacts': src=local service endpoint, dst=remote client).
             // Rebuild full name from ALL locked ports to this remote CI
             $accumulated_name = _bulkBuildImpactName($computers_id, $remote_itemtype, $remote_items_id);
             if ($accumulated_name === '') $accumulated_name = $port_label;
-            // Remove wrong direction only (Computer→remote would be "impacts")
-            _bulkRemoveImpactRelation('Computer', $computers_id, $remote_itemtype, $remote_items_id);
-            _bulkSetImpactRelation($remote_itemtype, $remote_items_id, 'Computer', $computers_id, $accumulated_name);
+            // When routed via the local instance, drop legacy direct host↔client edges
+            if ($local_edge_type === 'DatabaseInstance') {
+                _bulkRemoveImpactRelation('Computer', $computers_id, $remote_itemtype, $remote_items_id);
+                _bulkRemoveImpactRelation($remote_itemtype, $remote_items_id, 'Computer', $computers_id);
+            }
+            // Remove wrong direction only (remote→local would be "depends")
+            _bulkRemoveImpactRelation($remote_itemtype, $remote_items_id, $local_edge_type, $local_edge_id);
+            _bulkSetImpactRelation($local_edge_type, $local_edge_id, $remote_itemtype, $remote_items_id, $accumulated_name);
             $count_processed++;
         } else {
             $count_skipped++;
@@ -161,12 +191,26 @@ foreach ($by_remote as $remote_addr => $conn) {
         if ($new_name === '') {
             _bulkRemoveImpactRelation($eff_type, $remote_items_id, 'Computer', $computers_id);
             _bulkRemoveImpactRelation('Computer', $computers_id, $eff_type, $remote_items_id);
+            // Also clean instance-routed edges (local DatabaseInstance ↔ client)
+            if ($local_edge_type === 'DatabaseInstance') {
+                _bulkRemoveImpactRelation($local_edge_type, $local_edge_id, $eff_type, $remote_items_id);
+                _bulkRemoveImpactRelation($eff_type, $remote_items_id, $local_edge_type, $local_edge_id);
+            }
         } else {
             _bulkUpdateImpactName($eff_type, $remote_items_id, 'Computer', $computers_id, $new_name);
             _bulkUpdateImpactName('Computer', $computers_id, $eff_type, $remote_items_id, $new_name);
+            if ($local_edge_type === 'DatabaseInstance') {
+                _bulkUpdateImpactName($local_edge_type, $local_edge_id, $eff_type, $remote_items_id, $new_name);
+            }
         }
         $count_processed++;
     }
+}
+
+// Host chain (once per bulk op): the host computer carries the instance —
+// Computer → impacts → DatabaseInstance, labelled "(host)".
+if ($locked && $chain_needed && $count_processed > 0) {
+    _bulkSetImpactRelation('Computer', $computers_id, 'DatabaseInstance', $local_edge_id, $port_label . ' (host)');
 }
 
 echo json_encode([
