@@ -419,8 +419,24 @@ class PluginNetstatconnectionsAutolock {
         return $row ? $row['name'] : strtoupper($proto) . ' ' . $port;
     }
 
+    /**
+     * Does the CI actually exist (and load) in GLPI? Guards every impact write
+     * so we never reference a deleted/missing item — GLPI's native Impact tab
+     * fatals on such rows (ImpactItem::findForItem reads $item->fields['id'] on
+     * an unloaded object → NULL insert). Cached per request.
+     */
+    private static function itemExists(string $type, int $id): bool {
+        static $cache = [];
+        if ($id <= 0 || $type === '' || !class_exists($type)) return false;
+        $k = $type . ':' . $id;
+        if (array_key_exists($k, $cache)) return $cache[$k];
+        $obj = new $type();
+        return $cache[$k] = (bool)$obj->getFromDB($id);
+    }
+
     private static function ensureImpactItem(string $type, int $id): void {
         global $DB;
+        if (!self::itemExists($type, $id)) return;   // never create Computer/0 or dangling
         $exists = $DB->request([
             'FROM'  => 'glpi_impactitems',
             'WHERE' => ['itemtype' => $type, 'items_id' => $id],
@@ -504,6 +520,7 @@ class PluginNetstatconnectionsAutolock {
     /** Upsert an impact relation with an exact pre-computed name (no append). */
     private static function setImpactRelation(string $src_type, int $src_id, string $dst_type, int $dst_id, string $name): void {
         global $DB;
+        if (!self::itemExists($src_type, $src_id) || !self::itemExists($dst_type, $dst_id)) return;
         $where = [
             'itemtype_source'   => $src_type, 'items_id_source'   => $src_id,
             'itemtype_impacted' => $dst_type, 'items_id_impacted' => $dst_id,
@@ -518,6 +535,7 @@ class PluginNetstatconnectionsAutolock {
 
     private static function ensureImpactRelation(string $src_type, int $src_id, string $dst_type, int $dst_id, string $name): void {
         global $DB;
+        if (!self::itemExists($src_type, $src_id) || !self::itemExists($dst_type, $dst_id)) return;
         $where = [
             'itemtype_source'   => $src_type, 'items_id_source'   => $src_id,
             'itemtype_impacted' => $dst_type, 'items_id_impacted' => $dst_id,

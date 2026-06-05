@@ -19,23 +19,89 @@ require_once __DIR__ . '/../inc/_bootstrap.php';
 
 Session::checkLoginUser();
 
-Html::header(
-    __('Network Dependency Map', 'netstatconnections'),
-    $_SERVER['PHP_SELF'],
-    'plugins',
-    'PluginNetstatconnectionsPort',
-    'graph'
-);
-
 global $DB;
+
+// ── Focus + embed mode (v2.11.0) ──────────────────────────────────────────────
+// No params  → the global locked-topology map (full page, as before).
+// for_itemtype/for_items_id → scope the SAME renderer to ONE CI's neighbourhood,
+//   so it can be embedded as a "Dependency Graph" tab on a Computer or Appliance.
+// embed=1    → drop the GLPI page chrome so it sits cleanly inside an iframe.
+$for_type = preg_replace('/[^A-Za-z0-9_\\\\]/', '', (string)($_GET['for_itemtype'] ?? ''));
+$for_id   = (int)($_GET['for_items_id'] ?? 0);
+$embed    = !empty($_GET['embed']);
+$is_focus = ($for_type !== '' && $for_id > 0);
+
+$scope_sql = 'c.is_locked = 1';   // default: confirmed/locked global topology
+if ($is_focus && $DB->tableExists('glpi_plugin_netstatconnections_connections')) {
+    $anchor_computers = [];   // computer ids whose OUTBOUND edges to include
+    $anchor_remote    = [];   // [itemtype, id] this CI appears as a remote target
+
+    if ($for_type === 'Appliance' && class_exists('PluginNetstatconnectionsAppliancedeps')) {
+        foreach (PluginNetstatconnectionsAppliancedeps::getMembers($for_id) as $m) {
+            if ($m['itemtype'] === 'Computer') $anchor_computers[] = (int)$m['items_id'];
+            $anchor_remote[] = [$m['itemtype'], (int)$m['items_id']];
+        }
+    } elseif ($for_type === 'Computer') {
+        $anchor_computers[] = $for_id;
+        $anchor_remote[]    = ['Computer', $for_id];
+    } else {
+        // any other CI type only ever appears as a remote endpoint
+        $anchor_remote[] = [$for_type, $for_id];
+    }
+
+    $clauses = [];
+    if (!empty($anchor_computers)) {
+        $clauses[] = 'c.computers_id IN (' . implode(',', array_map('intval', $anchor_computers)) . ')';
+    }
+    $by_type = [];
+    foreach ($anchor_remote as $ar) { $by_type[$ar[0]][] = (int)$ar[1]; }
+    foreach ($by_type as $t => $ids) {
+        $clauses[] = "(c.remote_itemtype = '" . $DB->escape($t) . "' AND c.remote_items_id IN ("
+                   . implode(',', array_map('intval', $ids)) . '))';
+    }
+    // Focus view = active resolved edges around the CI (locked OR not), so the
+    // per-CI graph is actually populated — not just the few locked ones.
+    if (!empty($clauses)) {
+        $scope_sql = '(' . implode(' OR ', $clauses) . ')';
+    }
+}
+
+if ($embed) {
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+       . '<meta name="viewport" content="width=device-width, initial-scale=1">'
+       . '<style>'
+       . 'body{margin:0;font-family:Inter,Segoe UI,Helvetica,Arial,sans-serif;font-size:13px;color:#222}'
+       . '.btn,.form-select,.form-control{font:inherit;padding:3px 8px;border:1px solid #ccc;border-radius:4px;background:#fff}'
+       . '.btn{cursor:pointer}.btn:hover{background:#f1f3f5}'
+       . '.vr{display:inline-block;width:1px;height:18px;background:#ddd;margin:0 4px;vertical-align:middle}'
+       . '.badge{display:inline-block;padding:2px 6px;border-radius:4px;background:#6c757d;color:#fff;font-size:11px}'
+       . '.bg-secondary{background:#6c757d}.text-muted{color:#888}.small{font-size:.85em}'
+       . '.form-check{display:inline-flex;align-items:center;gap:4px;margin:0}.form-switch{}'
+       . '.me-1{margin-right:4px}.mx-1{margin:0 4px}.ms-auto{margin-left:auto}'
+       . '.d-flex{display:flex}.align-items-center{align-items:center}.flex-wrap{flex-wrap:wrap}'
+       . '.gap-2{gap:8px}.gap-3{gap:12px}.px-3{padding:0 12px}.py-2{padding:8px 0}.py-1{padding:4px 0}'
+       . '.border-bottom{border-bottom:1px solid #e5e5e5}.bg-light{background:#f8f9fa}.bg-white{background:#fff}'
+       . '.fw-bold{font-weight:600}.text-primary{color:#0d6efd}.alert{padding:12px;margin:12px}'
+       . '.alert-info{background:#e7f1ff;border:1px solid #b6d4fe;border-radius:6px}'
+       . '</style></head><body>';
+} else {
+    Html::header(
+        __('Network Dependency Map', 'netstatconnections'),
+        $_SERVER['PHP_SELF'],
+        'plugins',
+        'PluginNetstatconnectionsPort',
+        'graph'
+    );
+}
 
 if (!$DB->tableExists('glpi_plugin_netstatconnections_connections')) {
     echo '<div class="alert alert-warning m-3">Plugin tables missing — please run Update.</div>';
-    Html::footer();
+    if ($embed) { echo '</body></html>'; } else { Html::footer(); }
     exit;
 }
 
-// ── Query: all locked active connections with resolved remote CIs ─────────────
+// ── Query: connections (scoped) with resolved remote CIs ──────────────────────
 $sql = "
     SELECT
         c.computers_id,
@@ -45,6 +111,7 @@ $sql = "
         c.protocol,
         c.impact_direction,
         COUNT(*)          AS conn_count,
+        MAX(c.seen_count) AS seen_count,
         MAX(p.color)      AS port_color,
         COALESCE(MAX(p.name), CONCAT(c.protocol, ' ', c.service_port)) AS port_name,
         MAX(rt.name)      AS relation_type,
@@ -54,7 +121,7 @@ $sql = "
            ON p.port_number = c.service_port AND p.protocol = c.protocol
     LEFT JOIN `glpi_plugin_netstatconnections_relationtypes` rt
            ON rt.id = p.relation_types_id AND rt.is_deleted = 0
-    WHERE c.is_locked         = 1
+    WHERE {$scope_sql}
       AND c.connection_status = 'active'
       AND c.remote_items_id  > 0
       AND c.remote_itemtype   IS NOT NULL
@@ -94,6 +161,9 @@ $node_shape = [
 
 $nodes_raw = [];
 $edges_raw = [];
+$edge_agg  = [];   // "from|to" => aggregated edge — collapses parallel service
+                   //              edges between the same pair into ONE line.
+$max_seen  = 1;    // global denominator for the weight %
 
 foreach ($db_rows as $row) {
     $local_key  = 'Computer_'              . (int)$row['computers_id'];
@@ -125,7 +195,7 @@ foreach ($db_rows as $row) {
         }
     }
 
-    // ── Edge ──────────────────────────────────────────────────────────
+    // ── Edge (aggregated by node-pair) ─────────────────────────────────
     // impact_direction 'impacts' → Computer is the source (it impacts remote)
     // impact_direction 'depends' → remote is the source (it impacts Computer)
     if (($row['impact_direction'] ?? 'impacts') === 'impacts') {
@@ -136,19 +206,48 @@ foreach ($db_rows as $row) {
         $to   = $local_key;
     }
 
-    $cnt   = (int)($row['conn_count'] ?? 1);
-    $label = ($row['port_name'] ?? ($row['protocol'] . ' ' . $row['service_port']))
-           . ($cnt > 1 ? ' ×' . $cnt : '');
+    $seen = (int)($row['seen_count'] ?? 1);
+    if ($seen > $max_seen) $max_seen = $seen;
+    $port = $row['port_name'] ?? ($row['protocol'] . ' ' . $row['service_port']);
+    $ak   = $from . '|' . $to;
 
+    if (!isset($edge_agg[$ak])) {
+        $edge_agg[$ak] = [
+            'from'          => $from,
+            'to'            => $to,
+            'ports'         => [],
+            'seen'          => 0,
+            'color'         => $row['port_color'] ?? '#6c757d',
+            'relation_type' => $row['relation_type']  ?? '',
+            'rel_color'     => $row['relation_color'] ?? '',
+        ];
+    }
+    if ($port !== '' && !in_array($port, $edge_agg[$ak]['ports'], true)) {
+        $edge_agg[$ak]['ports'][] = $port;
+    }
+    $edge_agg[$ak]['seen'] = max($edge_agg[$ak]['seen'], $seen);
+    if ($edge_agg[$ak]['relation_type'] === '' && !empty($row['relation_type'])) {
+        $edge_agg[$ak]['relation_type'] = $row['relation_type'];
+        $edge_agg[$ak]['rel_color']     = $row['relation_color'] ?? '';
+    }
+}
+
+// Expand aggregated pairs → one render edge each, weighted by observation %.
+foreach ($edge_agg as $a) {
+    sort($a['ports']);
+    $wpct = (int)round(100 * $a['seen'] / max(1, $max_seen));
     $edges_raw[] = [
-        'from'          => $from,
-        'to'            => $to,
-        'label'         => $label,
-        'port'          => $row['port_name'] ?? ($row['protocol'] . ' ' . $row['service_port']),
-        'color'         => $row['port_color'] ?? '#6c757d',
-        'weight'        => min($cnt, 8),
-        'relation_type' => $row['relation_type']  ?? '',
-        'rel_color'     => $row['relation_color'] ?? '',
+        'from'          => $a['from'],
+        'to'            => $a['to'],
+        'label'         => implode(', ', $a['ports']),
+        'port'          => $a['ports'][0] ?? '',   // primary, for legacy refs
+        'ports'         => $a['ports'],            // full set, for the port filter
+        'color'         => $a['color'],
+        'weight'        => max(1, min(8, (int)round($a['seen'] / max(1, $max_seen) * 8))),
+        'wpct'          => $wpct,
+        'seen'          => $a['seen'],
+        'relation_type' => $a['relation_type'],
+        'rel_color'     => $a['rel_color'],
     ];
 }
 
@@ -209,6 +308,14 @@ $edge_count  = count($edges_raw);
       <?php endforeach; ?>
     </select>
 
+    <!-- Min-weight filter — hide low-confidence (rare) edges to cut noise -->
+    <span class="vr mx-1"></span>
+    <label class="small text-muted mb-0" for="ns-weight" title="<?= __('Hide dependencies seen in fewer than this % of observed cycles', 'netstatconnections') ?>">
+      <i class="ti ti-filter"></i> <?= __('Min weight', 'netstatconnections') ?>
+    </label>
+    <input type="range" id="ns-weight" min="0" max="100" value="0" step="5" style="width:110px">
+    <span class="small text-muted" id="ns-weight-val" style="width:34px">0%</span>
+
     <!-- Node search -->
     <input type="search" id="ns-search"
            class="form-control form-control-sm" style="width:180px"
@@ -235,7 +342,9 @@ $edge_count  = count($edges_raw);
 
   <?php if (empty($nodes_raw)): ?>
     <div class="alert alert-info m-4">
-      <?= __('No locked connections with resolved CIs yet. Lock some connections first to see the map.', 'netstatconnections') ?>
+      <?= $is_focus
+            ? __('No resolved dependencies for this item yet. They appear once connections are collected and remote IPs resolve to CIs.', 'netstatconnections')
+            : __('No locked connections with resolved CIs yet. Lock some connections first to see the map.', 'netstatconnections') ?>
     </div>
   <?php else: ?>
 
@@ -389,13 +498,25 @@ $vis_asset_url = Plugin::getWebDir('netstatconnections', true) . '/front/vis-ass
     if (!RAW_NODES.length) return;
 
     // ── Helpers ───────────────────────────────────────────────────────
+    // vis-network@10 renders a STRING title as plain text (HTML shows as
+    // literal tags); to get formatted tooltips we must hand it a DOM element.
+    function htmlTitle(html) {
+        const el = document.createElement('div');
+        el.innerHTML = html;
+        return el;
+    }
+    function esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
     function makeVisNode(n) {
         const col   = NODE_COLOR[n.type] || '#6c757d';
         const shape = NODE_SHAPE[n.type] || 'dot';
         return {
             id:    n.id,
             label: n.label,
-            title: '<b>' + n.type + '</b><br>' + n.label + '<br><small>Click to open</small>',
+            title: htmlTitle('<b>' + esc(n.type) + '</b><br>' + esc(n.label) + '<br><small>Click to open</small>'),
             url:   n.url,
             shape: shape,
             size:  shape === 'database' ? 14 : 18,
@@ -413,16 +534,24 @@ $vis_asset_url = Plugin::getWebDir('netstatconnections', true) . '/front/vis-ass
     function makeVisEdge(e, idx, showLabel) {
         // Color by relation type when available, fall back to port badge color
         const edgeCol = e.rel_color || e.color || '#6c757d';
+        // Weight-driven styling: persistent edges are thick + solid + opaque;
+        // rare edges thin + faint + dashed, so noise recedes by default instead
+        // of every line competing equally (the v2.x spaghetti).
+        const wpct    = (e.wpct == null) ? 100 : e.wpct;
+        const width   = 1 + Math.round((wpct / 100) * 5);     // 1..6 px
+        const opacity = 0.25 + (wpct / 100) * 0.65;           // 0.25..0.90
         return {
             id:     idx,
             from:   e.from,
             to:     e.to,
             label:  showLabel ? e.label : '',
-            title:  (e.relation_type ? '<b>' + e.relation_type + '</b><br>' : '') + e.label,
+            title:  htmlTitle((e.relation_type ? '<b>' + esc(e.relation_type) + '</b><br>' : '') + esc(e.label)
+                  + '<br><small>weight ' + wpct + '% &middot; seen ' + (e.seen || 1) + '</small>'),
             port:   e.port,
             arrows: { to: { enabled: true, scaleFactor: 0.55 } },
-            color:  { color: edgeCol, highlight: edgeCol, hover: edgeCol, opacity: 0.85 },
-            width:  Math.max(1, Math.round(e.weight * 0.5)),
+            color:  { color: edgeCol, highlight: edgeCol, hover: edgeCol, opacity: opacity },
+            width:  width,
+            dashes: wpct < 15,
             font:   { size: 10, align: 'middle',
                       strokeWidth: 3, strokeColor: '#f8f9fa', color: '#333' },
             smooth: { type: 'dynamic' },
@@ -535,7 +664,7 @@ $vis_asset_url = Plugin::getWebDir('netstatconnections', true) . '/front/vis-ass
                 const dirCol   = isSource ? '#c0392b' : '#2980b9';
                 const dirArrow = isSource ? '→' : '←';
                 const dirTip   = isSource ? 'impacts' : 'depends on';
-                const cnt      = e.weight || 1;
+                const cnt      = e.seen || 1;   // observed cycles, not the scaled weight
 
                 const edgeCol = e.rel_color || e.color || '#6c757d';
                 html += '<div style="display:flex;align-items:center;gap:7px;padding:7px 9px;'
@@ -609,6 +738,10 @@ $vis_asset_url = Plugin::getWebDir('netstatconnections', true) . '/front/vis-ass
         const connEdges  = new Set(network.getConnectedEdges(nodeId));
 
         // ── Node colours ──────────────────────────────────────────────
+        // Only restyle nodes/edges currently in the dataset — never re-add ones
+        // hidden by the port/weight filter (vis update() would otherwise upsert).
+        const _pN = new Set(nodeDS.getIds());
+        const _pE = new Set(edgeDS.getIds());
         nodeDS.update(RAW_NODES.map(n => {
             if (n.id === nodeId) {
                 const col = NODE_COLOR[n.type] || '#6c757d';
@@ -634,7 +767,7 @@ $vis_asset_url = Plugin::getWebDir('netstatconnections', true) . '/front/vis-ass
                      color: { background: '#e8e8e8', border: '#c5c5c5',
                               highlight: { background: '#e8e8e8', border: '#c5c5c5' } },
                      font:  { color: '#bbb', size: 11 } };
-        }));
+        }).filter(u => _pN.has(u.id)));
 
         // ── Edge colours ──────────────────────────────────────────────
         const showLbl = document.getElementById('ns-labels').checked;
@@ -646,7 +779,7 @@ $vis_asset_url = Plugin::getWebDir('netstatconnections', true) . '/front/vis-ass
             }
             return { id: i, label: '',
                      color: { color: '#d5d5d5', opacity: 0.2 }, width: 1 };
-        }));
+        }).filter(u => _pE.has(u.id)));
 
         // ── Tooltip ───────────────────────────────────────────────────
         const upTxt   = upstream.size
@@ -669,8 +802,10 @@ $vis_asset_url = Plugin::getWebDir('netstatconnections', true) . '/front/vis-ass
         _blastTip.style.display = 'none';
 
         const showLbl = document.getElementById('ns-labels').checked;
-        nodeDS.update(RAW_NODES.map(makeVisNode));
-        edgeDS.update(RAW_EDGES.map((e, i) => makeVisEdge(e, i, showLbl)));
+        const _pN = new Set(nodeDS.getIds());
+        const _pE = new Set(edgeDS.getIds());
+        nodeDS.update(RAW_NODES.map(makeVisNode).filter(u => _pN.has(u.id)));
+        edgeDS.update(RAW_EDGES.map((e, i) => makeVisEdge(e, i, showLbl)).filter(u => _pE.has(u.id)));
     }
 
     network.on('hoverNode', params => _blastOn(params.node));
@@ -698,41 +833,54 @@ $vis_asset_url = Plugin::getWebDir('netstatconnections', true) . '/front/vis-ass
     // ── Toolbar — Edge labels toggle ──────────────────────────────────
     document.getElementById('ns-labels').addEventListener('change', function () {
         const show = this.checked;
+        const _pE = new Set(edgeDS.getIds());
         edgeDS.update(
             RAW_EDGES.map((e, i) => ({ id: i, label: show ? e.label : '' }))
+                     .filter(u => _pE.has(u.id))
         );
     });
 
-    // ── Toolbar — Port filter ─────────────────────────────────────────
-    document.getElementById('ns-port-filter').addEventListener('change', function () {
-        const sel      = this.value;
-        const showLbl  = document.getElementById('ns-labels').checked;
+    // ── Toolbar — combined Port + Min-weight filter ───────────────────
+    // Rebuilds the dataset keeping STABLE edge ids (= index into RAW_EDGES) so
+    // the blast-radius highlight, which maps over RAW_EDGES, stays correct after
+    // filtering. (The old port-only handler reindexed edges, quietly breaking
+    // blast-radius on a filtered view — fixed here.)
+    function applyFilters() {
+        const sel     = document.getElementById('ns-port-filter').value;
+        const minW    = parseInt(document.getElementById('ns-weight').value, 10) || 0;
+        const showLbl = document.getElementById('ns-labels').checked;
 
-        const filtEdges = sel
-            ? RAW_EDGES.filter(e => e.port === sel)
-            : RAW_EDGES;
+        // [edge, originalIndex] pairs that pass both filters
+        const kept = [];
+        RAW_EDGES.forEach((e, i) => {
+            const passW = (e.wpct == null) || (e.wpct >= minW);
+            const passP = !sel || (Array.isArray(e.ports) ? e.ports.includes(sel) : e.port === sel);
+            if (passW && passP) kept.push([e, i]);
+        });
 
         const usedIds = new Set();
-        filtEdges.forEach(e => { usedIds.add(e.from); usedIds.add(e.to); });
-
-        const filtNodes = sel
-            ? RAW_NODES.filter(n => usedIds.has(n.id))
-            : RAW_NODES;
+        kept.forEach(([e]) => { usedIds.add(e.from); usedIds.add(e.to); });
+        const filtNodes = RAW_NODES.filter(n => usedIds.has(n.id));
 
         nodeDS.clear();
         edgeDS.clear();
         nodeDS.add(filtNodes.map(makeVisNode));
-        edgeDS.add(filtEdges.map((e, i) => makeVisEdge(e, i, showLbl)));
+        edgeDS.add(kept.map(([e, i]) => makeVisEdge(e, i, showLbl)));   // id = i (stable)
 
         document.getElementById('ns-node-count').textContent = filtNodes.length + ' nodes';
-        document.getElementById('ns-edge-count').textContent = filtEdges.length + ' edges';
+        document.getElementById('ns-edge-count').textContent = kept.length + ' edges';
 
-        // Re-run layout briefly for filtered subset
         network.setOptions({ physics: { enabled: true } });
         setTimeout(() => {
             network.setOptions({ physics: { enabled: false } });
             network.fit({ animation: true });
-        }, 1500);
+        }, 1200);
+    }
+
+    document.getElementById('ns-port-filter').addEventListener('change', applyFilters);
+    document.getElementById('ns-weight').addEventListener('input', function () {
+        document.getElementById('ns-weight-val').textContent = this.value + '%';
+        applyFilters();
     });
 
     // ── Toolbar — Node search ─────────────────────────────────────────
@@ -755,4 +903,4 @@ $vis_asset_url = Plugin::getWebDir('netstatconnections', true) . '/front/vis-ass
 })();
 </script>
 
-<?php Html::footer(); ?>
+<?php if ($embed) { echo '</body></html>'; } else { Html::footer(); } ?>

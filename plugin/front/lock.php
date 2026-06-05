@@ -291,9 +291,19 @@ echo json_encode([
  * Used for the main Computer↔Remote relation where _buildImpactName
  * already computed the full accumulated label.
  */
+/** A CI must actually load, or GLPI's Impact tab fatals on the relation. */
+function _itemExists(string $type, int $id): bool {
+    static $cache = [];
+    if ($id <= 0 || $type === '' || !class_exists($type)) return false;
+    $k = $type . ':' . $id;
+    if (array_key_exists($k, $cache)) return $cache[$k];
+    $o = new $type();
+    return $cache[$k] = (bool)$o->getFromDB($id);
+}
+
 function _setImpactRelation(string $src_type, int $src_id, string $dst_type, int $dst_id, string $name): void {
     global $DB;
-    if ($src_id <= 0 || $dst_id <= 0) return;
+    if (!_itemExists($src_type, $src_id) || !_itemExists($dst_type, $dst_id)) return;
 
     $where = [
         'itemtype_source'   => $src_type, 'items_id_source'   => $src_id,
@@ -314,7 +324,7 @@ function _setImpactRelation(string $src_type, int $src_id, string $dst_type, int
  */
 function _ensureImpactRelation(string $src_type, int $src_id, string $dst_type, int $dst_id, string $name): void {
     global $DB;
-    if ($src_id <= 0 || $dst_id <= 0) return;
+    if (!_itemExists($src_type, $src_id) || !_itemExists($dst_type, $dst_id)) return;
 
     $where = [
         'itemtype_source'   => $src_type, 'items_id_source'   => $src_id,

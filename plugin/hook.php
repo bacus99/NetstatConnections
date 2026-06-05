@@ -638,6 +638,48 @@ function plugin_netstatconnections_install(): bool {
     // The "Network Dependencies" tab on each Appliance derives depends-on /
     // used-by from member CI edges at read time (PluginNetstatconnectionsAppliancedeps).
 
+    // ── Impact-graph integrity cleanup (v2.10.2 / v2.10.3) ────────────
+    // GLPI's native Impact tab fatals ("items_id cannot be null") on relation
+    // rows whose endpoint can't be loaded — ImpactItem::findForItem reads
+    // $item->fields['id'] on an unloaded object. Two flavours of garbage:
+    //   (a) 0 / NULL ids   — pre-2.10.2 autolock had no <=0 guard;
+    //   (b) DANGLING refs  — the CI was DELETED but locked connection rows
+    //                        lingered, so autolock kept rebuilding relations to
+    //                        a computer/CI that no longer exists.
+    // Both are invalid for ANY itemtype, so purging is safe globally and
+    // unblocks the native tab immediately.
+    try {
+        // (a) null / zero ids
+        $DB->doQuery("DELETE FROM `glpi_impactitems` WHERE `items_id` IS NULL OR `items_id` = 0");
+        $DB->doQuery("DELETE FROM `glpi_impactrelations`
+            WHERE `items_id_source`   IS NULL OR `items_id_source`   = 0
+               OR `items_id_impacted` IS NULL OR `items_id_impacted` = 0");
+
+        // (b) dangling references — scoped to the CI types this plugin creates.
+        $our_types = ['Computer', 'Cluster', 'DatabaseInstance', 'NetworkEquipment', 'Printer', 'Phone', 'Peripheral'];
+        $endpoints = [];   // "Type:id" => [type, id]
+        foreach ([['itemtype_source', 'items_id_source'], ['itemtype_impacted', 'items_id_impacted']] as [$tcol, $icol]) {
+            $res = $DB->doQuery("SELECT DISTINCT `{$tcol}` AS t, `{$icol}` AS i
+                                 FROM `glpi_impactrelations`
+                                 WHERE `{$tcol}` IN ('" . implode("','", $our_types) . "')");
+            while ($r = $DB->fetchAssoc($res)) {
+                $endpoints[$r['t'] . ':' . (int)$r['i']] = [$r['t'], (int)$r['i']];
+            }
+        }
+        foreach ($endpoints as [$t, $i]) {
+            $ok = false;
+            if ($i > 0 && class_exists($t)) {
+                $obj = new $t();
+                $ok  = (bool)$obj->getFromDB($i);
+            }
+            if (!$ok) {
+                $DB->delete('glpi_impactrelations', ['itemtype_source'   => $t, 'items_id_source'   => $i]);
+                $DB->delete('glpi_impactrelations', ['itemtype_impacted' => $t, 'items_id_impacted' => $i]);
+                $DB->delete('glpi_impactitems',     ['itemtype'          => $t, 'items_id'          => $i]);
+            }
+        }
+    } catch (\Throwable $e) { /* best effort */ }
+
     // ── Cron tasks (registered once) ─────────────────────────────────
     PluginNetstatconnectionsCrontask::registerCronTasks();
 

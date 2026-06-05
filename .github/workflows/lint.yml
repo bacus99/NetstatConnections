@@ -1,0 +1,59 @@
+name: Lint
+
+# Syntax gate for the plugin. The two outages during the 2.x testing phase were
+# both shippable-by-accident: a PHP parse error (2.7.0) and a double-quote inside
+# an SQL "--" comment that terminated a double-quoted PHP string (the closed_at
+# comment). This workflow makes both classes impossible to merge.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  php:
+    name: PHP syntax + SQL-quote guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'        # match the GLPI 11 server (PHP 8.3.x)
+          coverage: none
+
+      - name: php -l on every PHP file
+        run: |
+          echo "Linting all plugin PHP files..."
+          # xargs returns non-zero if ANY php -l fails, so the step fails the build.
+          find plugin -type f -name '*.php' -print0 | xargs -0 -n1 php -l
+
+      - name: Guard — no double quotes inside SQL "--" comments
+        run: |
+          # A double quote inside an SQL '--' comment that lives inside a
+          # double-quoted PHP string closes the string early -> parse error.
+          # (This is the exact bug that took the plugin offline in 2.7.0.)
+          if grep -rnE '^[[:space:]]*--.*"' --include='*.php' plugin; then
+            echo "::error::Double quote found inside an SQL '--' comment. Inside a"
+            echo "double-quoted PHP query string this terminates the string. Use"
+            echo "single quotes, backticks, or drop the quotes."
+            exit 1
+          fi
+          echo "OK — no risky SQL-comment quotes."
+
+  perl:
+    name: Perl syntax (best-effort)
+    runs-on: ubuntu-latest
+    # GLPI::Agent modules aren't installed in CI, so the inventory .pm files that
+    # 'use parent GLPI::Agent::...' can't fully compile here. Non-blocking; we
+    # still get a signal on the standalone collector (core modules only).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: perl -c on the standalone collector
+        run: |
+          if [ -f agent/glpi-netstat-collect.pl ]; then
+            perl -c agent/glpi-netstat-collect.pl \
+              || echo "::warning::perl -c reported issues (may be missing optional modules)"
+          fi

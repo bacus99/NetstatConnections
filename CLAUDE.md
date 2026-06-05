@@ -1,43 +1,43 @@
-# CLAUDE.md — Projet GLPI 11
+# CLAUDE.md — NetstatConnections (GLPI 11 outil)
 
-## Portée
-Ce dépôt concerne principalement le développement, la maintenance et l’intégration de plugins **GLPI 11** en PHP/MySQL.
+## Conventions partagées
 
-## Règles globales
-- Toujours privilégier la compatibilité **GLPI 11**.
-- Lire le code existant avant de modifier quoi que ce soit.
-- Faire des changements minimaux, ciblés et réversibles.
-- Préserver le comportement existant sauf demande explicite.
-- Réutiliser les mécanismes GLPI existants avant de créer une solution custom.
+Les conventions et règles globales pour tous mes projets GLPI 11 sont centralisées dans [`../GLPI-Shared/`](../GLPI-Shared/CLAUDE.md). À lire en premier pour toute tâche : versioning, namespacing, hooks, API DB, workflow de validation, migrations, endpoints AJAX, et processus de build/release.
 
-## Validation avant code
-Avant d’écrire, modifier ou proposer du code, valider les faits nécessaires.
+Ce fichier ne couvre que ce qui est spécifique à *ce* projet.
 
-Niveau de confiance minimal requis : **95%** sur :
-- la version GLPI visée ;
-- les classes, hooks, routes ou fichiers concernés ;
-- le schéma de données et l’impact technique ;
-- les implications de sécurité et de compatibilité.
+## Portée du projet
 
-Si le seuil de confiance n’est pas atteint :
-- ne pas produire de code final directement ;
-- vérifier la documentation, le dépôt et le schéma réel ;
-- signaler explicitement les incertitudes ;
-- proposer d’abord une étape de validation ou un prototype limité.
+NetstatConnections est un **collecteur d'inventaire** écrit en Perl (`glpi-netstat-collect.pl`) qui interroge `netstat` sur Windows et soumet les connexions actives à un serveur GLPI 11 via son API.
 
-## Sécurité
-- Ne jamais faire confiance aux entrées brutes.
-- Prévenir SQL injection, XSS et erreurs d’autorisation.
-- Vérifier les droits avant toute action sensible.
-- Ne jamais stocker de secrets dans le code.
+Ce n'est **pas** un plugin GLPI au sens classique (pas de `setup.php`, pas de tables `glpi_plugin_*`). C'est un **agent autonome** qui consomme l'API GLPI côté client.
 
-## Usage des règles spécialisées
-Pour les tâches spécifiques, appliquer en plus les règles dans `.claude/rules/` :
-- `glpi-plugin-api.md`
-- `glpi-migration.md`
-- `glpi-validation.md`
+## Architecture spécifique
 
-En cas de doute :
-- `CLAUDE.md` définit les règles globales et non négociables ;
-- les fichiers dans `.claude/rules/` ajoutent des règles spécialisées ;
-- aucune règle spécialisée ne doit contredire ce fichier.
+```
+NetstatConnections/
+├── glpi-netstat-collect.pl   Script principal Perl (~33 KB)
+├── glpi-netstat.bat          Wrapper Windows pour l'exécution planifiée
+├── netstat-collect.ini       Configuration runtime (cible GLPI, credentials)
+├── netstat-collect_empty.ini Template de config sans secrets
+└── perl/                     Modules Perl bundlés
+```
+
+## Points spécifiques à ce projet
+
+- **Langue Perl, pas PHP.** Les règles dans GLPI-Shared sur PSR-4, Hooks::, `$DB->doQuery()` ne s'appliquent pas ici — ce code ne tourne pas dans GLPI.
+- **Consommateur d'API GLPI** — les règles de [`../GLPI-Shared/rules/glpi-plugin-api.md`](../GLPI-Shared/rules/glpi-plugin-api.md) s'appliquent inversement : il faut respecter le contrat d'API tel qu'exposé par GLPI 11.
+- **Pas de cible de catalogue plugins** — ce projet ne va pas sur plugins.glpi-project.org. Le build/release de [`../GLPI-Shared/rules/glpi-build-release.md`](../GLPI-Shared/rules/glpi-build-release.md) ne s'applique pas.
+- **Configuration** : `netstat-collect.ini` contient des secrets — ne jamais commiter. Le template `netstat-collect_empty.ini` est ce qui est versionné.
+
+## Règles globales (rappel)
+
+Les règles non-négociables de [`../GLPI-Shared/CLAUDE.md`](../GLPI-Shared/CLAUDE.md) s'appliquent ici aussi :
+
+1. **Compatibilité GLPI 11** côté API consommée.
+2. **Lire le code existant** avant de modifier.
+3. **Changements minimaux, ciblés et réversibles.**
+4. **Préserver le comportement existant** sauf demande explicite.
+5. **Ne jamais faire confiance aux entrées brutes.**
+
+Workflow de validation à 95% : voir [`../GLPI-Shared/rules/glpi-validation.md`](../GLPI-Shared/rules/glpi-validation.md).

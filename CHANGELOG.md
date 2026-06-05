@@ -1,5 +1,130 @@
 # Changelog
 
+## [2.11.0] — 2026-06-05
+
+### Dependency Graph as a tab on Computer + Appliance
+
+The interactive Dependency Map — previously only a global page — is now a
+**"Dependency Graph" tab on every Computer and Appliance**, scoped to that CI's
+own neighbourhood. Same renderer (GLPI CI icons/shapes, edge aggregation, weight
+thickness, min-weight slider, blast-radius hover, side panel) — just focused.
+
+- **`graph.php` gained focus + embed modes (additive):**
+  - `for_itemtype` / `for_items_id` scope the graph to one CI's neighbourhood
+    — a Computer's outbound edges + inbound edges from other computers, or an
+    Appliance's members' edges (via `Appliancedeps::getMembers`). Other CI types
+    scope to where they appear as a remote endpoint.
+  - Focus view includes **active + resolved** edges (locked *or* not), so a
+    per-CI graph is actually populated — not just the handful of locked ones.
+    (The global page is unchanged: still the locked confirmed-topology map.)
+  - `embed=1` drops the GLPI page chrome and emits a self-contained document
+    with minimal inline CSS, so it renders cleanly inside an iframe.
+- **`inc/graphtab.class.php`** — registers a "Dependency Graph" tab on `Computer`
+  and `Appliance` that embeds `graph.php` (focus+embed) in an iframe. Reuses the
+  full renderer rather than duplicating ~800 lines.
+
+This is the "use the dependency map at a lower level, on a tab" ask: the native
+GLPI Impact tab stays as-is; this gives the *dynamic* map per-CI.
+
+⚠️ Deploy: `front/graph.php`, `inc/graphtab.class.php`, `setup.php`. `php -l`,
+copy, plugin Upgrade (registers the tab), clear cache, restart php-fpm.
+Same-origin iframe → GLPI's `X-Frame-Options: SAMEORIGIN` allows it; if the tab
+renders blank, check the server isn't forcing `DENY`.
+
+## [2.10.3] — 2026-06-04
+
+### Fix (cont.): impact graph still fataled on **deleted** CIs
+
+2.10.2 fixed 0/NULL-id relations but the error persisted with GLPI-core warnings
+(`Impact.php:1681`, `ImpactItem.php:66/78` — "Undefined array key id"). Confirmed
+against GLPI 11.0.7 source: `ImpactItem::findForItem()` reads `$item->fields['id']`,
+and if the relation's endpoint references a CI that **doesn't load** (a *deleted*
+computer with lingering locked connection rows, not just a 0 id), `fields` is
+empty → `'id'` undefined → `INSERT … VALUES ('Computer', NULL)` → fatal.
+
+- **Existence guard, not just `> 0`**: new `itemExists()` (getFromDB-backed,
+  request-cached) now gates every impact write in `autolock`, `lock.php`, and
+  `bulk_lock.php` — a relation is only written if **both** endpoints actually
+  load. Stops the hourly self-heal from rebuilding relations to deleted CIs.
+- **Cleanup extended** (`hook.php`): in addition to 0/NULL-id rows, the upgrade
+  now purges **dangling** `glpi_impactrelations` (and matching `glpi_impactitems`)
+  whose endpoint — for the CI types this plugin manages — no longer resolves via
+  `getFromDB`. Unblocks the native Impact tab immediately on upgrade.
+
+⚠️ Deploy: `inc/autolock.class.php`, `front/lock.php`, `front/bulk_lock.php`,
+`hook.php`, `setup.php`. Run the plugin **Upgrade** (executes the cleanup), clear
+cache, restart php-fpm — the Impact tab should render right after.
+
+## [2.10.2] — 2026-06-04
+
+### Fix: impact graph "items_id cannot be null" (1048)
+
+GLPI's native Impact tab fataled with `INSERT INTO glpi_impactitems … VALUES ('Computer', NULL)`.
+
+Root cause: **`autolock`** wrote `glpi_impactrelations` rows with a **0 id**. Its
+relation helpers were typed `int` but lacked the explicit `<= 0` guard that
+`lock.php`/`bulk_lock.php` already had, so a 0-valued endpoint (e.g. an
+unresolved cluster/host chain) slipped through — and the hourly self-heal pass
+kept re-creating them. When GLPI core renders the Impact tab it materialises an
+`impactitem` for the referenced item; item 0 doesn't exist, so `getID()` returns
+false → NULL insert → fatal.
+
+- **Guards added** to `autolock`'s `ensureImpactItem` / `setImpactRelation` /
+  `ensureImpactRelation`: bail when any id `<= 0` or itemtype is empty. (lock.php
+  and bulk_lock.php were already guarded — autolock was the lone gap.)
+- **Cleanup on upgrade** (`hook.php`): purge `glpi_impactitems` and
+  `glpi_impactrelations` rows with a NULL/0 id. Such rows are invalid for any
+  itemtype (no CI has id 0), so it's safe globally — and unblocks GLPI's native
+  Impact tab immediately, before the next autolock cycle.
+
+⚠️ Deploy: `inc/autolock.class.php`, `hook.php`, `setup.php`. After the plugin
+upgrade the bad rows are gone and the Impact tab renders; new ones can't be
+created.
+
+## [2.10.1] — 2026-06-04
+
+### Fix: dependency-map tooltips showed raw HTML
+
+vis-network@10 renders a **string** `title` as plain text (so `<b>…</b><br>` showed
+as literal tags), unlike older versions that parsed it as HTML. Node and edge
+tooltips now pass a real DOM element (`htmlTitle()` helper), so they render
+formatted again; dynamic values (CI name, type, relation, port label) are
+HTML-escaped (`esc()`) to keep the markup safe.
+
+Deploy: `front/graph.php`, `setup.php` only.
+
+## [2.10.0] — 2026-06-04
+
+### Dependency map — de-spaghetti (incremental, vis-network)
+
+The dependency map turned into a red-line hairball on dense servers. Three
+changes on the existing `graph.php` (no library swap) cut the noise:
+
+1. **Edge aggregation** — parallel service edges between the same node-pair
+   collapse into ONE line labelled with all services (`MSSQL 1433, AlwaysOn 5022`).
+   This alone removes the bulk of the lines (the screenshot's five parallel
+   "MSSQL 1433" edges become one).
+2. **Weight-driven styling** — each aggregated edge is thick + opaque + solid
+   when persistent, thin + faint + **dashed** when rare, using the v2.9.1 weight
+   ratio (`seen_count` ÷ host's most-seen edge). Noise recedes by default instead
+   of every line competing equally. Edge tooltip shows `weight % · seen N`.
+3. **Min-weight slider** — toolbar control hides edges below a chosen % of
+   observed cycles (and orphaned nodes), so you can dial the map from
+   "everything" down to "only the rock-solid dependencies."
+
+Also fixed while here: the port filter (and now the weight filter, labels toggle,
+and blast-radius hover) keep **stable edge IDs** = index into RAW_EDGES, so
+blast-radius highlighting stays correct on a filtered view, and hover no longer
+re-adds filtered-out edges (a latent bug in the old port-only filter).
+
+⚠️ Deploy: `front/graph.php`, `setup.php` only. `php -l`, copy, clear cache,
+restart php-fpm. No schema/agent/cron change.
+
+Note: this is the **incremental** path. A future **Cytoscape.js rewrite** (tiered
+dagre/elk layout + collapsible appliance compound nodes — the full Faddom/
+ServiceNow look) is captured in ROADMAP as a phase-2 option to weigh once these
+wins are seen in practice.
+
 ## [2.9.1] — 2026-06-03
 
 ### True weight ratio (Connections tab)
