@@ -161,12 +161,15 @@ class PluginNetstatconnectionsResolver {
 
         // Built-in GLPI CI types we resolve remote endpoints to. Name-matchable
         // types are tried in this order (most specific first) for DNS/hint
-        // matches; the same set (minus Cluster, which has no network ports)
-        // gates the glpi_ipaddresses → networkport walk below.
+        // matches; the same set also gates the glpi_ipaddresses → networkport
+        // walk below.
         //
         // NOTE: these are GLPI's native asset classes — NOT the GLPI 11 custom
         // "Asset Definition" framework. Each has its own glpi_<type>s table with
-        // name + is_deleted, and (except Cluster) can own network ports/IPs.
+        // name + is_deleted. ALL of them — Cluster included — can own GLPI
+        // network ports/IPs (Cluster has a NetworkPort tab), so an AlwaysOn /
+        // FCI listener VIP registered on the Cluster CI resolves straight to the
+        // Cluster, and Pillar 3.5 routes clients through it to the DBI.
         static $name_tables = [
             'Cluster'          => 'glpi_clusters',
             'Computer'         => 'glpi_computers',
@@ -175,9 +178,11 @@ class PluginNetstatconnectionsResolver {
             'Phone'            => 'glpi_phones',
             'Peripheral'       => 'glpi_peripherals',
         ];
-        // itemtypes acceptable as the owner of a resolved IP (via networkport)
+        // itemtypes acceptable as the owner of a resolved IP (via networkport).
+        // Cluster is included so a listener VIP pinned to the Cluster CI resolves
+        // to the Cluster rather than falling through to "internal/unresolved".
         static $ip_itemtypes = [
-            'Computer', 'NetworkEquipment', 'Printer', 'Phone', 'Peripheral',
+            'Cluster', 'Computer', 'NetworkEquipment', 'Printer', 'Phone', 'Peripheral',
         ];
 
         // 1. Try hostname lookup — stored hint first, then live DNS reverse lookup

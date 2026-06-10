@@ -1,5 +1,35 @@
 # Changelog
 
+## [2.11.1] — 2026-06-09
+
+### Fix: AlwaysOn / FCI listener VIP now resolves to the Cluster CI
+
+A SQL Always On Availability Group (or FCI) listener is reached by clients via a
+floating **listener VIP**. When that VIP is registered on the **Cluster** CI's
+NetworkPort tab in GLPI, the dependency map should route clients through the
+cluster — `Client → Cluster → DatabaseInstance` — instead of drawing a direct
+edge to a physical node.
+
+It wasn't. `Resolver::resolveIP()` excluded `Cluster` from the list of itemtypes
+accepted as the owner of a resolved IP (`$ip_itemtypes`), on the mistaken premise
+that "Cluster has no network ports". Clusters **do** have a NetworkPort tab, so a
+listener VIP pinned to the Cluster matched `glpi_networkports.itemtype = 'Cluster'`
+and was then thrown away by the `in_array(..., $ip_itemtypes)` gate — the VIP fell
+through to "internal/unresolved" and never reached the cluster-routing logic.
+
+- **`inc/resolver.class.php`** — added `Cluster` to `$ip_itemtypes`. A listener
+  VIP on the Cluster CI now resolves directly to the Cluster, after which the
+  existing Pillar 3.5 cluster routing draws `Client → Cluster → DBI`.
+
+Requires (modeling, unchanged): the SQL **DatabaseInstance** must be hosted on the
+Cluster (`itemtype=Cluster`), not on a member node, for `resolveToInstance` to find
+it. Re-lock one client edge (or wait for the autolock self-heal pass) to relocate
+existing direct edges onto the cluster path.
+
+⚠️ Deploy: `inc/resolver.class.php`, `setup.php`. `php -l`, copy, clear cache,
+restart php-fpm. (No schema change — no plugin Upgrade required, but bump shows in
+the plugin list.)
+
 ## [2.11.0] — 2026-06-05
 
 ### Dependency Graph as a tab on Computer + Appliance
